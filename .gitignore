@@ -1,0 +1,10 @@
+node_modules/
+dist/
+build/
+*.zip
+*.hash
+.DS_Store
+*.log
+coverage/
+.idea/
+.vscode/

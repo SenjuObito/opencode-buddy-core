@@ -1,0 +1,19 @@
+{
+  "name": "opencode-buddy-core",
+  "version": "0.1.0",
+  "description": "Core protocol daemon and lifecycle kernel for OpenCode Buddy (VS Code & JetBrains IDEs)",
+  "type": "module",
+  "main": "daemon.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SenjuObito/opencode-buddy-core.git"
+  },
+  "scripts": {
+    "start": "node daemon.js",
+    "test": "node --test permission-ipc.test.js utils/*.test.* services/opencode/*.test.* channel-manager.protocol.test.mjs",
+    "pack:zip": "node scripts/pack-zip.mjs"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.18.29"
+  }
+}
