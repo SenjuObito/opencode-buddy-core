@@ -472,7 +472,67 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
         });
       }
       break;
+    case 'session.reasoning.delta':
+      if (turn && typeof props?.delta === 'string' && props.delta) {
+        emitJsonStringMarker('[THINKING_DELTA]', props.delta);
+      }
+      break;
+    case 'session.text.delta':
+      if (turn && typeof props?.delta === 'string' && props.delta) {
+        emitJsonStringMarker('[CONTENT_DELTA]', props.delta);
+      }
+      break;
+    case 'session.usage.updated':
+      if (turn && props?.tokens && typeof props.tokens === 'object') {
+        turn.lastInfo = {
+          ...(turn.lastInfo || {}),
+          tokens: props.tokens,
+          cost: props.cost,
+        };
+        const usage = tokensToUsage(props.tokens);
+        if (usage) {
+          if (typeof props.cost === 'number' && props.cost > 0) {
+            usage.cost = props.cost;
+          }
+          emitUsage(usage);
+        }
+      }
+      break;
+    case 'session.tool.called':
+    case 'session.tool.input': {
+      if (turn) {
+        const callID = props.toolID || props.id;
+        const name = props.tool || props.name || 'tool';
+        const input = (props.input && typeof props.input === 'object' && !Array.isArray(props.input))
+          ? props.input
+          : {};
+        if (callID) {
+          const inputJson = JSON.stringify(input);
+          const emittedJson = turn.toolUseInput.get(callID);
+          if (emittedJson === undefined || (Object.keys(input).length > 0 && emittedJson !== inputJson)) {
+            turn.toolUseInput.set(callID, inputJson);
+            turn.toolUseDone.add(callID);
+            emitToolUseMessage({ id: callID, name, input });
+          }
+        }
+      }
+      break;
+    }
+    case 'session.tool.success':
+    case 'session.tool.failed': {
+      if (turn) {
+        const callID = props.toolID || props.id;
+        if (callID && !turn.toolResultDone.has(callID)) {
+          turn.toolResultDone.add(callID);
+          const isError = type === 'session.tool.failed' || Boolean(props.error);
+          const content = isError ? (props.error || '') : (props.output ?? props.result ?? '');
+          emitToolResultMessage({ toolUseId: callID, content, isError });
+        }
+      }
+      break;
+    }
     case 'session.idle':
+    case 'session.execution.succeeded':
       if (turn) _settleTurn(turn, { success: true });
       break;
     case 'session.compacted': {
@@ -486,8 +546,9 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       }));
       break;
     }
-    case 'session.error': {
-      const err = props?.error || { message: 'session.error' };
+    case 'session.error':
+    case 'session.execution.failed': {
+      const err = props?.error || { message: type };
       if (turn) {
         _settleTurn(turn, { success: false, error: err });
       }
@@ -495,7 +556,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       // 同样走 marker，宿主按 sessionID + pending 状态过滤。有 active turn
       // 时错误属于当前对话 turn，不能误报为压缩失败。
       if (!turn) {
-        logDebug('session.error (no turn):', sessionID || '', JSON.stringify(err).substring(0, 200));
+        logDebug(`${type} (no turn):`, sessionID || '', JSON.stringify(err).substring(0, 200));
         emitJsonStringMarker('[SESSION_COMPACT_RESULT]', JSON.stringify({
           sessionID: sessionID || props?.info?.id || '',
           success: false,

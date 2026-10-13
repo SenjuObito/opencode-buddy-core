@@ -11,8 +11,10 @@
 
 import * as cp from 'node:child_process';
 import * as http from 'node:http';
+import * as net from 'node:net';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import * as crypto from 'node:crypto';
 import { homedir } from 'node:os';
 import {
   resolveOpenCodeCliPath,
@@ -27,6 +29,8 @@ import { logInfo, logWarn, logError, logDebug } from '../../utils/logger.js';
 /** @type {cp.ChildProcess | null} */
 let _process = null;
 let _serverUrl = null;
+let _serverPassword = process.env.OPENCODE_SERVER_PASSWORD || process.env.OPENCODE_PASSWORD || null;
+let _isV2 = true;
 /** @type {Promise<string> | null} */
 let _startPromise = null;
 /** Last port passed to start(), so an auto-restart rebinds the same port the
@@ -106,6 +110,35 @@ export function getServerUrl() {
 }
 
 /**
+ * @returns {string | null} The server Basic Auth password, if any.
+ */
+export function getServerPassword() {
+  return _serverPassword;
+}
+
+/**
+ * @returns {boolean} Whether the running opencode server is v2.
+ */
+export function isV2() {
+  return _isV2;
+}
+
+function tryReadServicePassword() {
+  try {
+    const servicePath = path.join(homedir(), '.config', 'opencode', 'service.json');
+    if (fs.existsSync(servicePath)) {
+      const data = JSON.parse(fs.readFileSync(servicePath, 'utf8'));
+      if (data && typeof data.password === 'string' && data.password.trim()) {
+        return data.password.trim();
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+/**
  * @returns {cp.ChildProcess | null} The running serve child process (test/debug hook).
  */
 export function getServeProcess() {
@@ -170,10 +203,26 @@ function waitForReady(url, timeoutMs) {
       return;
     }
 
-    const req = http.get(url, (res) => {
-      // Any HTTP response (including 404) means the server is listening
+    const checkUrl = _isV2 ? `${url}/api/info` : url;
+    const reqUrl = new URL(checkUrl);
+    const headers = {};
+    if (_isV2 && _serverPassword) {
+      headers.Authorization = 'Basic ' + Buffer.from(`opencode:${_serverPassword}`).toString('base64');
+    }
+
+    const req = http.get(reqUrl, { headers }, (res) => {
       res.resume(); // consume response body
-      resolve(true);
+      if (_isV2) {
+        // v2 must return 200 OK (not 401 Unauthorized or 404) to be considered healthy & authenticated
+        if (res.statusCode === 200) {
+          resolve(true);
+        } else {
+          setTimeout(() => resolve(poll()), 300);
+        }
+      } else {
+        // v1: any response means server is listening
+        resolve(true);
+      }
     });
 
     req.on('error', () => {
@@ -188,6 +237,17 @@ function waitForReady(url, timeoutMs) {
   });
 
   return poll();
+}
+
+function isPortAvailable(port) {
+  return new Promise((resolve) => {
+    const tester = net.createServer();
+    tester.once('error', () => resolve(false));
+    tester.once('listening', () => {
+      tester.close(() => resolve(true));
+    });
+    tester.listen(port, '127.0.0.1');
+  });
 }
 
 /**
@@ -225,12 +285,29 @@ async function doStart(port) {
     );
   }
 
-  const url = `http://localhost:${port}`;
+  let targetPort = port;
+  let url = `http://localhost:${targetPort}`;
 
-  // If something is already serving on the port (e.g. the user started
-  // `opencode serve` manually, or another daemon owns it), reuse it instead of
-  // spawning a duplicate that would fail to bind. This also makes `preconnect`
-  // cheap when serve is already warm.
+  // Windows .cmd/.bat shims (and bare command names) require a shell so
+  // PATHEXT can resolve the real executable. Enrich PATH with common user bin
+  // dirs (pnpm global, Scoop shims, …) that an IDE-launched process often lacks.
+  const spawnEnv = { ...process.env };
+  enrichPathWithBinDirs(spawnEnv, commonCliBinDirs(homedir()));
+
+  const systemNode = probeSystemNode(spawnEnv);
+  const cliVersion = probeCliVersion(binary, spawnEnv);
+  _isV2 = !cliVersion || !cliVersion.startsWith('1.');
+
+  if (_isV2) {
+    if (!_serverPassword) {
+      _serverPassword = tryReadServicePassword() || crypto.randomBytes(16).toString('hex');
+    }
+    spawnEnv.OPENCODE_SERVER_PASSWORD = _serverPassword;
+    spawnEnv.OPENCODE_PASSWORD = _serverPassword;
+  }
+
+  // If something is already serving on the port (and authenticated with our password),
+  // reuse it instead of spawning a duplicate that would fail to bind.
   if (await waitForReady(url, 1500)) {
     logInfo('opencode-serve-manager', `Reusing existing server on ${url}`);
     _serverUrl = url;
@@ -238,11 +315,20 @@ async function doStart(port) {
     return url;
   }
 
-  // Windows .cmd/.bat shims (and bare command names) require a shell so
-  // PATHEXT can resolve the real executable. Enrich PATH with common user bin
-  // dirs (pnpm global, Scoop shims, …) that an IDE-launched process often lacks.
-  const spawnEnv = { ...process.env };
-  enrichPathWithBinDirs(spawnEnv, commonCliBinDirs(homedir()));
+  // If the target port cannot be bound (e.g. occupied by another process or an unauthenticated rogue serve),
+  // roll over to the next available port.
+  if (!(await isPortAvailable(targetPort))) {
+    for (let candidate = targetPort + 1; candidate <= targetPort + 10; candidate++) {
+      if (await isPortAvailable(candidate)) {
+        logInfo('opencode-serve-manager', `Port ${targetPort} is occupied; rolling over to port ${candidate}`);
+        targetPort = candidate;
+        url = `http://localhost:${targetPort}`;
+        _lastPort = targetPort;
+        break;
+      }
+    }
+  }
+
   const spawnOpts = {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: spawnEnv,
@@ -251,24 +337,24 @@ async function doStart(port) {
     spawnOpts.shell = true;
   }
 
-  const systemNode = probeSystemNode(spawnEnv);
-  const cliVersion = probeCliVersion(binary, spawnEnv);
-
   logInfo('opencode-serve-manager:env', '════════════════════════════════════════════════════');
   logInfo('opencode-serve-manager:env', 'Runtime Environment Diagnostic:');
   logInfo('opencode-serve-manager:env', `  - Daemon Node ExecPath: ${process.execPath} (${process.version})`);
   logInfo('opencode-serve-manager:env', `  - System Node (PATH): ${systemNode ? `${systemNode.path} (${systemNode.version})` : 'none detected'}`);
   logInfo('opencode-serve-manager:env', `  - Platform: ${process.platform} (${process.arch})`);
   logInfo('opencode-serve-manager:env', `  - OpenCode CLI Resolved: ${binary}`);
-  logInfo('opencode-serve-manager:env', `  - OpenCode CLI Version: ${cliVersion || 'unknown'}`);
-  logInfo('opencode-serve-manager:env', `  - Target Port: ${port}`);
+  logInfo('opencode-serve-manager:env', `  - OpenCode CLI Version: ${cliVersion || 'unknown'} (isV2: ${_isV2})`);
+  if (_serverPassword) {
+    logInfo('opencode-serve-manager:env', `  - Auth Enabled: Basic auth configured`);
+  }
+  logInfo('opencode-serve-manager:env', `  - Target Port: ${targetPort}`);
   logInfo('opencode-serve-manager:env', '════════════════════════════════════════════════════');
-  logInfo('opencode-serve-manager:spawn', `Starting: ${binary} serve --port ${port}`);
+  logInfo('opencode-serve-manager:spawn', `Starting: ${binary} serve --port ${targetPort}`);
 
   const spawnStartedAt = Date.now();
 
   return new Promise((resolve, reject) => {
-    const child = cp.spawn(binary, ['serve', '--port', String(port)], spawnOpts);
+    const child = cp.spawn(binary, ['serve', '--port', String(targetPort)], spawnOpts);
     _process = child;
     const childPid = child.pid;
     logInfo('opencode-serve-manager:spawn', `Spawned child process PID=${childPid}`);

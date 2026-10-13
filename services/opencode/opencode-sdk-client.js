@@ -12,9 +12,60 @@
  */
 
 import { createOpencodeClient } from '@opencode-ai/sdk/v2';
+import * as serveManager from './opencode-serve-manager.js';
 
 let _client = null;
 let _baseUrl = null;
+
+function getAuthHeader() {
+  const pwd = serveManager.getServerPassword();
+  if (!pwd) return {};
+  const encoded = Buffer.from(`opencode:${pwd}`).toString('base64');
+  return { Authorization: `Basic ${encoded}` };
+}
+
+async function* subscribeEventsV2(baseUrl, password, directory, signal) {
+  const headers = {};
+  if (password) {
+    headers.Authorization = 'Basic ' + Buffer.from(`opencode:${password}`).toString('base64');
+  }
+  if (directory) {
+    headers['x-opencode-directory'] = encodeURIComponent(directory);
+  }
+
+  const res = await fetch(`${baseUrl}/api/event`, { headers, signal });
+  if (!res.ok) {
+    throw new Error(`Failed to subscribe events: HTTP ${res.status}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (!signal?.aborted) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // keep trailing incomplete chunk
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith(':')) continue;
+        if (trimmed.startsWith('data: ')) {
+          try {
+            const parsed = JSON.parse(trimmed.slice(6));
+            yield parsed;
+          } catch {
+            // ignore non-json
+          }
+        }
+      }
+    }
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+}
 
 /**
  * Get (creating on first use) the shared SDK client bound to the running
@@ -26,7 +77,16 @@ let _baseUrl = null;
 export function getClient(baseUrl = 'http://localhost:4096') {
   if (!_client || _baseUrl !== baseUrl) {
     _baseUrl = baseUrl;
-    _client = createOpencodeClient({ baseUrl });
+    _client = createOpencodeClient({
+      baseUrl,
+      fetch: async (req) => {
+        const pwd = serveManager.getServerPassword();
+        if (pwd && !req.headers.has('authorization')) {
+          req.headers.set('authorization', 'Basic ' + Buffer.from(`opencode:${pwd}`).toString('base64'));
+        }
+        return fetch(req);
+      },
+    });
   }
   return _client;
 }
@@ -57,11 +117,16 @@ export function setBaseUrl(baseUrl) {
 // ── Health ────────────────────────────────────────────────────────────────
 
 /**
- * Ping the server by listing sessions.
+ * Ping the server by checking server status / session list.
  * @returns {Promise<boolean>}
  */
 export async function health() {
   try {
+    if (serveManager.isV2()) {
+      const url = `${_baseUrl || 'http://localhost:4096'}/api/info`;
+      const res = await fetch(url, { headers: getAuthHeader() });
+      return res.status === 200;
+    }
     const client = getClient();
     const result = await client.session.list();
     return result.error === undefined || result.error === null;
@@ -78,6 +143,22 @@ export async function health() {
  * @returns {Promise<object>} the created session (with `id`)
  */
 export async function createSession(title, directory) {
+  if (serveManager.isV2()) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session`;
+    const body = {};
+    if (title) body.title = title;
+    if (directory) body.directory = directory;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to create session: HTTP ${res.status} ${await res.text()}`);
+    }
+    const json = await res.json();
+    return json.data || json;
+  }
   const params = {};
   if (title) params.title = title;
   if (directory) params.directory = directory;
@@ -94,6 +175,22 @@ export async function createSession(title, directory) {
  * @returns {Promise<object[]>}
  */
 export async function listSessions(directory, limit) {
+  if (serveManager.isV2()) {
+    const query = new URLSearchParams();
+    if (limit && Number(limit) > 0) query.set('limit', String(limit));
+    if (directory) query.set('directory', directory);
+    const qs = query.toString();
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session${qs ? `?${qs}` : ''}`;
+    const res = await fetch(url, {
+      headers: getAuthHeader(),
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to list sessions: HTTP ${res.status} ${await res.text()}`);
+    }
+    const json = await res.json();
+    const list = Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []);
+    return list;
+  }
   const params = {};
   if (limit && Number(limit) > 0) params.limit = Number(limit);
   if (directory) params.directory = directory;
@@ -110,6 +207,17 @@ export async function listSessions(directory, limit) {
  * @returns {Promise<object | null>}
  */
 export async function getSession(id, directory) {
+  if (serveManager.isV2()) {
+    try {
+      const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(id)}`;
+      const res = await fetch(url, { headers: getAuthHeader() });
+      if (!res.ok) return null;
+      const json = await res.json();
+      return json.data || json;
+    } catch {
+      return null;
+    }
+  }
   const params = { sessionID: id };
   if (directory) params.directory = directory;
   const result = await getClient().session.get(params);
@@ -123,6 +231,17 @@ export async function getSession(id, directory) {
  * @returns {Promise<void>}
  */
 export async function deleteSession(id, directory) {
+  if (serveManager.isV2()) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(id)}`;
+    const res = await fetch(url, {
+      method: 'DELETE',
+      headers: getAuthHeader(),
+    });
+    if (!res.ok && res.status !== 404) {
+      throw new Error(`Failed to delete session: HTTP ${res.status} ${await res.text()}`);
+    }
+    return;
+  }
   const params = { sessionID: id };
   if (directory) params.directory = directory;
   const result = await getClient().session.delete(params);
@@ -138,6 +257,18 @@ export async function deleteSession(id, directory) {
  * @returns {Promise<object>}
  */
 export async function updateSessionTitle(id, title, directory) {
+  if (serveManager.isV2()) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(id)}`;
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to update session title: HTTP ${res.status} ${await res.text()}`);
+    }
+    return { id, title };
+  }
   const params = { sessionID: id, title };
   if (directory) params.directory = directory;
   const result = await getClient().session.update(params);
@@ -154,6 +285,18 @@ export async function updateSessionTitle(id, title, directory) {
  * @returns {Promise<object>}
  */
 export async function updateSessionMetadata(id, metadata, directory) {
+  if (serveManager.isV2()) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(id)}`;
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ metadata }),
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to update session metadata: HTTP ${res.status} ${await res.text()}`);
+    }
+    return { id, metadata };
+  }
   const params = { sessionID: id, metadata };
   if (directory) params.directory = directory;
   const result = await getClient().session.update(params);
@@ -237,6 +380,31 @@ function redactParamsForLog(params) {
 }
 
 export async function promptAsync(sessionId, text, options = {}) {
+  if (serveManager.isV2()) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/prompt`;
+    const body = {
+      text,
+    };
+    if (options.agent) body.agent = options.agent;
+    if (options.model) body.model = options.model;
+    if (options.system) body.system = options.system;
+    if (options.tools) body.tools = options.tools;
+    if (Array.isArray(options.parts) && options.parts.length > 0) {
+      body.parts = options.parts;
+    }
+    console.error('[opencode-sdk-client:v2] promptAsync:', JSON.stringify(redactParamsForLog(body)));
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Prompt failed: HTTP ${res.status} ${errText}`);
+    }
+    return;
+  }
+
   const params = {
     sessionID: sessionId,
     parts: [{ type: 'text', text }],
@@ -276,6 +444,22 @@ export async function shellAsync(sessionId, command, options = {}) {
   const agent = (typeof options.agent === 'string' && options.agent.trim())
     ? options.agent.trim()
     : 'build';
+
+  if (serveManager.isV2()) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/shell`;
+    const body = { command, agent };
+    if (options.model) body.model = options.model;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      throw new Error(`Shell failed: HTTP ${res.status} ${await res.text()}`);
+    }
+    return;
+  }
+
   const params = {
     sessionID: sessionId,
     command,
@@ -303,6 +487,26 @@ export async function shellAsync(sessionId, command, options = {}) {
  * @returns {Promise<object>}
  */
 export async function sendCommand(sessionId, command, options = {}) {
+  if (serveManager.isV2()) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/command`;
+    const body = {
+      command,
+      arguments: options.arguments ?? '',
+    };
+    if (options.model) body.model = options.model;
+    if (options.agent) body.agent = options.agent;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      throw new Error(`Command failed: HTTP ${res.status} ${await res.text()}`);
+    }
+    const json = await res.json();
+    return json.data || json;
+  }
+
   const params = {
     sessionID: sessionId,
     command,
@@ -330,6 +534,15 @@ export async function sendCommand(sessionId, command, options = {}) {
  * @returns {Promise<void>}
  */
 export async function abort(sessionId, directory) {
+  if (serveManager.isV2()) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/interrupt`;
+    await fetch(url, {
+      method: 'POST',
+      headers: getAuthHeader(),
+    }).catch(() => {});
+    return;
+  }
+
   const params = { sessionID: sessionId };
   if (directory) params.directory = directory;
   const result = await getClient().session.abort(params);
@@ -353,6 +566,19 @@ export async function abort(sessionId, directory) {
  * @returns {Promise<void>}
  */
 export async function summarizeSession(sessionId, directory, model) {
+  if (serveManager.isV2()) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/compact`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    if (!res.ok) {
+      throw new Error(`Summarize failed: HTTP ${res.status} ${await res.text()}`);
+    }
+    return;
+  }
+
   const resolved = await resolveSummarizeModel(model, sessionId, directory);
   console.error(`[summarize] model resolved: ${resolved ? `${resolved.providerID}/${resolved.modelID}` : 'FAILED (null)'}`);
   if (!resolved) {
@@ -458,6 +684,20 @@ export async function unshareSession(sessionId, directory) {
  * @returns {Promise<object | null>} updated session
  */
 export async function revertSession(sessionId, messageID, directory) {
+  if (serveManager.isV2()) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/revert`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(messageID ? { messageID } : {}),
+    });
+    if (!res.ok) {
+      throw new Error(`Revert failed: HTTP ${res.status}`);
+    }
+    const json = await res.json();
+    return json.data || json;
+  }
+
   const params = { sessionID: sessionId, messageID };
   if (directory) params.directory = directory;
   console.error(`[DEBUG][RevertSession] request sessionID=${sessionId} messageID=${messageID}`);
@@ -495,6 +735,20 @@ export async function unrevertSession(sessionId, directory) {
  * @returns {Promise<object | null>} the forked session (with `id`)
  */
 export async function forkSession(sessionId, messageID, directory) {
+  if (serveManager.isV2()) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/fork`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(messageID ? { messageID } : {}),
+    });
+    if (!res.ok) {
+      throw new Error(`Fork failed: HTTP ${res.status}`);
+    }
+    const json = await res.json();
+    return json.data || json;
+  }
+
   const params = { sessionID: sessionId };
   if (messageID) params.messageID = messageID;
   if (directory) params.directory = directory;
@@ -518,6 +772,12 @@ export async function forkSession(sessionId, messageID, directory) {
  * @returns {Promise<AsyncIterable<object>>}
  */
 export async function subscribeEvents(directory, signal) {
+  if (serveManager.isV2()) {
+    const baseUrl = _baseUrl || 'http://localhost:4096';
+    const pwd = serveManager.getServerPassword();
+    return subscribeEventsV2(baseUrl, pwd, directory, signal);
+  }
+
   const params = {};
   if (directory) params.directory = directory;
   const options = {};
@@ -533,6 +793,64 @@ export async function subscribeEvents(directory, signal) {
  * @returns {Promise<object[]>} provider list, each with `.models` keyed by model id
  */
 export async function getProviders(directory) {
+  if (serveManager.isV2()) {
+    try {
+      const baseUrl = _baseUrl || 'http://localhost:4096';
+      const [provRes, modRes] = await Promise.all([
+        fetch(`${baseUrl}/api/provider`, { headers: getAuthHeader() }),
+        fetch(`${baseUrl}/api/model`, { headers: getAuthHeader() }),
+      ]);
+      const provJson = provRes.ok ? await provRes.json() : {};
+      const modJson = modRes.ok ? await modRes.json() : {};
+      const provList = Array.isArray(provJson.data) ? provJson.data : (Array.isArray(provJson) ? provJson : []);
+      const modList = Array.isArray(modJson.data) ? modJson.data : (Array.isArray(modJson) ? modJson : []);
+
+      const providersMap = new Map();
+      for (const p of provList) {
+        if (p?.id) {
+          providersMap.set(p.id, {
+            id: p.id,
+            name: p.name || p.id,
+            models: {},
+            options: p.options || {},
+            _isPublicKey: p.options?.apiKey === 'public',
+          });
+        }
+      }
+
+      for (const m of modList) {
+        const provId = m.providerID || 'opencode';
+        if (!providersMap.has(provId)) {
+          providersMap.set(provId, {
+            id: provId,
+            name: provId,
+            models: {},
+            _isPublicKey: m.settings?.apiKey === 'public',
+          });
+        }
+        const providerObj = providersMap.get(provId);
+        const mId = m.modelID || m.id;
+        const variantsMap = {};
+        if (Array.isArray(m.variants)) {
+          for (const v of m.variants) {
+            if (v && v.id) variantsMap[v.id] = v.settings || {};
+          }
+        }
+        providerObj.models[mId] = {
+          id: mId,
+          name: m.name || mId,
+          variants: variantsMap,
+          limit: m.limit || { context: 200000 },
+        };
+      }
+
+      return Array.from(providersMap.values());
+    } catch (e) {
+      console.error('[getProviders:v2] failed:', e);
+      return [];
+    }
+  }
+
   const params = {};
   if (directory) params.directory = directory;
   const result = await getClient().config.providers(params);
@@ -554,6 +872,18 @@ export async function getProviders(directory) {
  * @returns {Promise<object[]>} agent list
  */
 export async function getAgents(directory) {
+  if (serveManager.isV2()) {
+    try {
+      const url = `${_baseUrl || 'http://localhost:4096'}/api/agent`;
+      const res = await fetch(url, { headers: getAuthHeader() });
+      if (!res.ok) return [];
+      const json = await res.json();
+      return Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []);
+    } catch {
+      return [];
+    }
+  }
+
   const params = {};
   if (directory) params.directory = directory;
   const result = await getClient().app.agents(params);
@@ -566,6 +896,18 @@ export async function getAgents(directory) {
  * @returns {Promise<object[]>} command list
  */
 export async function getCommands(directory) {
+  if (serveManager.isV2()) {
+    try {
+      const url = `${_baseUrl || 'http://localhost:4096'}/api/command`;
+      const res = await fetch(url, { headers: getAuthHeader() });
+      if (!res.ok) return [];
+      const json = await res.json();
+      return Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []);
+    } catch {
+      return [];
+    }
+  }
+
   try {
     const params = {};
     if (directory) params.directory = directory;
@@ -591,6 +933,20 @@ export async function getCommands(directory) {
  * @returns {Promise<void>}
  */
 export async function replyPermission(sessionId, permissionID, reply, message, directory) {
+  if (serveManager.isV2() && sessionId) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/permission/${encodeURIComponent(permissionID)}/reply`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reply, message }),
+    });
+    if (!res.ok) {
+      throw new Error(`replyPermission failed (${permissionID}): HTTP ${res.status}`);
+    }
+    console.error('[DEBUG][OpenCodeDaemon:v2] permission replied ok:', permissionID, '→', reply);
+    return;
+  }
+
   const client = getClient();
   const params = { requestID: permissionID, reply };
   if (message) params.message = message;
@@ -717,6 +1073,84 @@ function summarizeError(error) {
  * @returns {Promise<object[]>} message entries `{ info, parts }`
  */
 export async function listMessages(sessionId, directory, options = {}) {
+  if (serveManager.isV2()) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/message`;
+    let res;
+    try {
+      res = await fetch(url, { headers: getAuthHeader() });
+    } catch (err) {
+      if (options.tolerateError) return [];
+      throw new Error(`Failed to list messages for session ${sessionId}: ${err?.message || err}`);
+    }
+    if (!res.ok) {
+      if (options.tolerateError) return [];
+      throw new Error(`Failed to list messages for session ${sessionId}: HTTP ${res.status}`);
+    }
+    const json = await res.json();
+    const list = Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []);
+
+    // Convert v2 messages to v1 { info, parts } entries for host compatibility
+    const entries = [];
+    for (const m of list) {
+      if (!m || typeof m !== 'object') continue;
+      if (m.type === 'idle' || m.type === 'compaction') continue;
+
+      const role = m.type === 'user' ? 'user' : (m.type === 'assistant' ? 'assistant' : m.type);
+      const modelStr = m.model ? (m.model.providerID && m.model.id ? `${m.model.providerID}/${m.model.id}` : m.model.id) : undefined;
+      const info = {
+        id: m.id,
+        role,
+        time: m.time || {},
+        model: modelStr,
+        tokens: m.tokens,
+        cost: m.cost,
+        providerID: m.model?.providerID,
+        modelID: m.model?.id,
+        sessionID: sessionId,
+      };
+
+      const parts = [];
+      if (role === 'user') {
+        if (typeof m.text === 'string' && m.text) {
+          parts.push({ type: 'text', text: m.text });
+        } else if (m.payload && typeof m.payload.text === 'string') {
+          parts.push({ type: 'text', text: m.payload.text });
+        } else if (Array.isArray(m.content)) {
+          for (const c of m.content) {
+            if (c.type === 'text') parts.push({ type: 'text', text: c.text });
+            else if (c.type === 'file') parts.push({ type: 'file', ...c });
+          }
+        }
+      } else if (role === 'assistant') {
+        if (Array.isArray(m.content)) {
+          for (const c of m.content) {
+            if (!c || typeof c !== 'object') continue;
+            if (c.type === 'reasoning') {
+              parts.push({ type: 'reasoning', text: c.text || '' });
+            } else if (c.type === 'text') {
+              parts.push({ type: 'text', text: c.text || '' });
+            } else if (c.type === 'tool' || c.type === 'tool_use') {
+              parts.push({
+                type: 'tool',
+                id: c.id,
+                callID: c.id || c.callID,
+                tool: c.tool || c.name,
+                state: {
+                  status: c.state?.status || 'completed',
+                  input: c.input || c.state?.input || {},
+                  output: c.output || c.state?.output || '',
+                  error: c.error || c.state?.error,
+                },
+              });
+            }
+          }
+        }
+      }
+      entries.push({ info, parts });
+    }
+    return entries;
+  }
+
   const params = { sessionID: sessionId };
   if (directory) params.directory = directory;
   const result = await getClient().session.messages(params);
@@ -741,6 +1175,25 @@ export async function listMessages(sessionId, directory, options = {}) {
  * @returns {Promise<Array<{ path: string, type: 'file' | 'directory' }>>}
  */
 export async function findFiles({ query = '', limit = '20', directory } = {}) {
+  if (serveManager.isV2()) {
+    try {
+      const numLimit = typeof limit === 'number' ? limit : (typeof limit === 'string' ? parseInt(limit, 10) || 20 : 20);
+      const url = `${_baseUrl || 'http://localhost:4096'}/api/fs/find?query=${encodeURIComponent(query || '')}&limit=${numLimit}`;
+      const res = await fetch(url, { headers: getAuthHeader() });
+      if (!res.ok) return [];
+      const json = await res.json();
+      const list = Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []);
+      return list.map((item) => {
+        if (typeof item === 'string') return { path: item, type: 'file' };
+        if (item && typeof item === 'object') return { path: item.path || item.name || '', type: item.type || 'file' };
+        return { path: String(item), type: 'file' };
+      }).filter((e) => Boolean(e.path));
+    } catch (err) {
+      console.error(`[findFiles:v2] error:`, err);
+      return [];
+    }
+  }
+
   try {
     const numLimit = typeof limit === 'number' ? limit : (typeof limit === 'string' ? parseInt(limit, 10) || 20 : 20);
     const result = await getClient().find.files({
@@ -773,6 +1226,23 @@ export async function findFiles({ query = '', limit = '20', directory } = {}) {
  * @returns {Promise<Array<{ name: string, status?: string, error?: string }>>}
  */
 export async function getMcpStatus(directory) {
+  if (serveManager.isV2()) {
+    try {
+      const url = `${_baseUrl || 'http://localhost:4096'}/api/mcp`;
+      const res = await fetch(url, { headers: getAuthHeader() });
+      if (!res.ok) return [];
+      const json = await res.json();
+      const list = Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []);
+      return list.map((item) => ({
+        name: typeof item === 'string' ? item : (item.name || item.id || 'mcp'),
+        status: item.status || 'connected',
+        error: item.error,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
   try {
     const params = {};
     if (directory) params.directory = directory;
