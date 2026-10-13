@@ -595,12 +595,11 @@ async function runDaemonMain() {
     crlfDelay: Infinity,
   });
 
-  // Turn commands (opencode.send / opencode.shell) are serialized because they
-  // own the SSE stream and the backgroundStreamRequestId fallback.  All other
-  // read-only / mutation commands run concurrently inside their own ALS context
-  // so that `getModels` / `listMessages` / `load_session` do not queue behind a
-  // cold `opencode.preconnect`.
-  let turnQueue = Promise.resolve();
+  // Turn commands (opencode.send / opencode.shell) are serialized per session to
+  // maintain chronological order within each session. Different sessions run
+  // concurrently without blocking each other. All other read-only / mutation commands
+  // run concurrently inside their own ALS context.
+  const sessionTurnQueues = new Map();
 
   rl.on('line', (line) => {
     // Skip empty lines
@@ -667,16 +666,26 @@ async function runDaemonMain() {
       return;
     }
 
-    // Turn commands are serialized; everything else runs concurrently.
+    // Turn commands are serialized per session; across different sessions they run concurrently.
     if (isTurnCommand(request.method)) {
-      turnQueue = turnQueue
+      const queueKey = (request.params && typeof request.params.sessionId === 'string' && request.params.sessionId.trim())
+        ? request.params.sessionId.trim()
+        : `__turn_${request.id}`;
+      const prevQueue = sessionTurnQueues.get(queueKey) || Promise.resolve();
+      const nextQueue = prevQueue
         .then(() => requestContext.run({ id: request.id }, () => processRequest(request)))
         .catch((e) => {
           _originalStderrWrite(
-            `[daemon] Turn queue error: ${e.message}\n`,
+            `[daemon] Turn queue error for session=${queueKey}: ${e.message}\n`,
             'utf8'
           );
+        })
+        .finally(() => {
+          if (sessionTurnQueues.get(queueKey) === nextQueue) {
+            sessionTurnQueues.delete(queueKey);
+          }
         });
+      sessionTurnQueues.set(queueKey, nextQueue);
       return;
     }
 
