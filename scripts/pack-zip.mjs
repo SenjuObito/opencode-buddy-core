@@ -32,26 +32,54 @@ if (existsSync(hashFile)) {
   rmSync(hashFile);
 }
 
-// 2. Execute zip command
-// Exclude tests, development configs, git, and dist itself
-const excludePatterns = [
-  'dist/*',
-  '.git/*',
-  '.github/*',
-  'scripts/*',
-  '*.test.*',
-  '*/*.test.*',
-  '*/*/*.test.*',
-  '.DS_Store',
-  'coverage/*',
-  'node_modules/.package-lock.json',
-];
+function commandExists(cmd) {
+  try {
+    const checkCmd = process.platform === 'win32' ? `where.exe ${cmd}` : `which ${cmd}`;
+    execSync(checkCmd, { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-const excludeArgs = excludePatterns.map((p) => `-x "${p}"`).join(' ');
-const cmd = `zip -r -y "${zipFile}" . ${excludeArgs}`;
-
-console.log('[pack-zip] Creating zip archive...');
-execSync(cmd, { cwd: rootDir, stdio: 'inherit' });
+// 2. Execute zip or tar command
+if (commandExists('zip')) {
+  // Exclude tests, development configs, git, and dist itself
+  const excludePatterns = [
+    'dist/*',
+    '.git/*',
+    '.github/*',
+    'scripts/*',
+    '*.test.*',
+    '*/*.test.*',
+    '*/*/*.test.*',
+    '.DS_Store',
+    'coverage/*',
+    'node_modules/.package-lock.json',
+  ];
+  const excludeArgs = excludePatterns.map((p) => `-x "${p}"`).join(' ');
+  const cmd = `zip -r -y "${zipFile}" . ${excludeArgs}`;
+  console.log('[pack-zip] Creating zip archive with zip...');
+  execSync(cmd, { cwd: rootDir, stdio: 'inherit' });
+} else if (commandExists('tar')) {
+  const tarExcludePatterns = [
+    'dist',
+    '.git',
+    '.github',
+    'scripts',
+    '*.test.*',
+    '.DS_Store',
+    'coverage',
+    'node_modules/.package-lock.json',
+  ];
+  const tarExcludeArgs = tarExcludePatterns.map((p) => `--exclude="${p}"`).join(' ');
+  const cmd = `tar -a -c -f "${zipFile}" ${tarExcludeArgs} .`;
+  console.log('[pack-zip] Creating zip archive with tar...');
+  execSync(cmd, { cwd: rootDir, stdio: 'inherit' });
+} else {
+  console.error('[pack-zip] Error: Neither "zip" nor "tar" command is available.');
+  process.exit(1);
+}
 
 if (!existsSync(zipFile)) {
   console.error('[pack-zip] Error: zip file was not generated!');
