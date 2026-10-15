@@ -22,13 +22,13 @@
  */
 export function normalizePermissionRequest(props) {
   const data = (props && typeof props.data === 'object') ? props.data : (props || {});
-  const permissionId = data.id ?? props?.permissionId ?? props?.id ?? '';
+  const permissionId = data.id ?? data.requestID ?? props?.permissionId ?? props?.requestID ?? props?.id ?? '';
   const resources = Array.isArray(data.resources)
     ? data.resources
     : Array.isArray(data.patterns)
       ? data.patterns
       : [];
-  const tool = data.action ?? data.permission ?? props?.tool ?? '';
+  const tool = data.action ?? data.permission ?? props?.action ?? props?.tool ?? '';
   // opencode attaches the originating tool call to permission requests
   // (data.tool.callID). Carry it through so the webview can anchor the card to
   // that exact tool_use block. Without it the card can only try to match the
@@ -55,10 +55,11 @@ export function normalizePermissionRequest(props) {
 }
 
 /**
- * Normalize a question event (v1 `question.asked` / v2 `question.v2.asked`)
+ * Normalize a question event (v1 `question.asked` / v2 `question.v2.asked` / `form.created` / `form.asked`)
  * into a canonical request object for the host.
  *
- * v1/v2 data: { id, sessionID, questions: [QuestionInfo], tool? }
+ * v1/v2 question data: { id, sessionID, questions: [QuestionInfo], tool? }
+ * v2 form data: { id, sessionID, title, fields: [FormField] }
  *
  * @param {object} props - event properties (with optional nested `data` for v2)
  * @returns {object}
@@ -68,15 +69,35 @@ export function normalizeQuestionRequest(props) {
   const tool = (data.tool && typeof data.tool === 'object')
     ? (data.tool.callID ?? data.tool.messageID ?? '')
     : (props?.tool ?? '');
-  const questions = Array.isArray(data.questions)
-    ? data.questions.map((q) => ({
+
+  let questions = [];
+  if (Array.isArray(data.questions)) {
+    questions = data.questions.map((q) => {
+      const item = {
         question: q.question ?? q.text ?? '',
         header: q.header ?? '',
         multiSelect: Boolean(q.multiple ?? q.multiSelect),
         custom: q.custom !== false,
         options: Array.isArray(q.options) ? q.options : [],
-      }))
-    : [];
+      };
+      if (q.key !== undefined) item.key = q.key;
+      return item;
+    });
+  } else if (Array.isArray(data.fields) || Array.isArray(props?.fields)) {
+    const fields = Array.isArray(data.fields) ? data.fields : props.fields;
+    const headerTitle = data.title || props?.title || '';
+    questions = fields.map((f) => ({
+      key: f.key ?? f.id,
+      question: f.title || f.description || f.key || '',
+      header: headerTitle,
+      multiSelect: f.type === 'multiselect',
+      custom: f.custom !== false,
+      options: Array.isArray(f.options)
+        ? f.options.map((opt) => (typeof opt === 'object' && opt !== null ? { label: opt.label ?? opt.value ?? '', description: opt.description ?? opt.hint ?? '' } : { label: String(opt), description: '' }))
+        : [],
+    }));
+  }
+
   return {
     type: 'question',
     sessionId: data.sessionID ?? props?.sessionID ?? undefined,

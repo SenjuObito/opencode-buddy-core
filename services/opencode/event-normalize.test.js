@@ -153,3 +153,34 @@ test('normalizePermissionRequest — preserves directory in v1 and v2 shapes', (
   });
   assert.equal(v2.directory, '/workspace/v2');
 });
+
+test('normalizeQuestionRequest — v2 Form fields shape', () => {
+  const result = normalizeQuestionRequest({
+    data: {
+      id: 'form_1',
+      sessionID: 'ses_form',
+      title: '选择配置',
+      fields: [
+        {
+          key: 'mode',
+          title: '运行模式',
+          type: 'multiselect',
+          options: [{ label: '开发', value: 'dev' }, { label: '生产', value: 'prod' }],
+        },
+      ],
+    },
+  });
+  assert.equal(result.type, 'question');
+  assert.equal(result.requestId, 'form_1');
+  assert.equal(result.sessionId, 'ses_form');
+  assert.equal(result.questions.length, 1);
+  assert.equal(result.questions[0].key, 'mode');
+  assert.equal(result.questions[0].question, '运行模式');
+  assert.equal(result.questions[0].header, '选择配置');
+  assert.equal(result.questions[0].multiSelect, true);
+  assert.deepEqual(result.questions[0].options, [
+    { label: '开发', description: '' },
+    { label: '生产', description: '' },
+  ]);
+});
+

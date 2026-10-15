@@ -147,7 +147,7 @@ export async function createSession(title, directory) {
     const url = `${_baseUrl || 'http://localhost:4096'}/api/session`;
     const body = {};
     if (title) body.title = title;
-    if (directory) body.directory = directory;
+    if (directory) body.location = { directory };
     const res = await fetch(url, {
       method: 'POST',
       headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
@@ -170,6 +170,18 @@ export async function createSession(title, directory) {
 }
 
 /**
+ * Normalize path for directory comparison (cross-platform, case-insensitive on Windows).
+ */
+function normalizeDirForMatch(p) {
+  if (!p || typeof p !== 'string') return '';
+  let normalized = p.replace(/\\/g, '/');
+  if (process.platform === 'win32') {
+    normalized = normalized.toLowerCase();
+  }
+  return normalized.replace(/\/+$/, '');
+}
+
+/**
  * @param {string} [directory]
  * @param {number|string} [limit]
  * @returns {Promise<object[]>}
@@ -178,7 +190,6 @@ export async function listSessions(directory, limit) {
   if (serveManager.isV2()) {
     const query = new URLSearchParams();
     if (limit && Number(limit) > 0) query.set('limit', String(limit));
-    if (directory) query.set('directory', directory);
     const qs = query.toString();
     const url = `${_baseUrl || 'http://localhost:4096'}/api/session${qs ? `?${qs}` : ''}`;
     const res = await fetch(url, {
@@ -188,8 +199,33 @@ export async function listSessions(directory, limit) {
       throw new Error(`Failed to list sessions: HTTP ${res.status} ${await res.text()}`);
     }
     const json = await res.json();
-    const list = Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []);
-    return list;
+    const rawList = Array.isArray(json.items)
+      ? json.items
+      : (Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []));
+
+    // Align v2 session objects with unified directory property
+    const unifiedList = rawList.map(s => {
+      if (!s || typeof s !== 'object') return s;
+      const dir = s.location?.directory || s.directory;
+      return {
+        ...s,
+        directory: dir || '',
+      };
+    });
+
+    // Robust directory filtering for Windows (case-insensitive & slash-normalized)
+    if (directory && typeof directory === 'string' && directory.trim() && unifiedList.length > 0) {
+      const target = normalizeDirForMatch(directory.trim());
+      const filtered = unifiedList.filter(s => {
+        const sessionDir = s.directory;
+        return sessionDir && normalizeDirForMatch(sessionDir) === target;
+      });
+      // Fallback: if project-specific match has sessions, return them;
+      // otherwise return all sessions so history list is never completely empty
+      return filtered.length > 0 ? filtered : unifiedList;
+    }
+
+    return unifiedList;
   }
   const params = {};
   if (limit && Number(limit) > 0) params.limit = Number(limit);
@@ -389,9 +425,35 @@ export async function promptAsync(sessionId, text, options = {}) {
     if (options.model) body.model = options.model;
     if (options.system) body.system = options.system;
     if (options.tools) body.tools = options.tools;
-    if (Array.isArray(options.parts) && options.parts.length > 0) {
-      body.parts = options.parts;
+
+    const files = [];
+    const sourceParts = Array.isArray(options.parts) ? options.parts : [];
+    for (const part of sourceParts) {
+      if (!part || typeof part !== 'object') continue;
+      const uri = part.url || part.uri || part.data;
+      if (uri) {
+        files.push({
+          uri,
+          name: part.filename || part.name || 'attachment',
+        });
+      }
     }
+    if (Array.isArray(options.files)) {
+      for (const f of options.files) {
+        if (!f || typeof f !== 'object') continue;
+        const uri = f.uri || f.url;
+        if (uri) {
+          files.push({
+            uri,
+            name: f.name || f.filename || 'attachment',
+          });
+        }
+      }
+    }
+    if (files.length > 0) {
+      body.files = files;
+    }
+
     console.error('[opencode-sdk-client:v2] promptAsync:', JSON.stringify(redactParamsForLog(body)));
     const res = await fetch(url, {
       method: 'POST',
@@ -490,11 +552,9 @@ export async function sendCommand(sessionId, command, options = {}) {
   if (serveManager.isV2()) {
     const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/command`;
     const body = {
-      command,
-      arguments: options.arguments ?? '',
+      name: command,
+      text: options.arguments ?? '',
     };
-    if (options.model) body.model = options.model;
-    if (options.agent) body.agent = options.agent;
     const res = await fetch(url, {
       method: 'POST',
       headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
@@ -503,8 +563,8 @@ export async function sendCommand(sessionId, command, options = {}) {
     if (!res.ok) {
       throw new Error(`Command failed: HTTP ${res.status} ${await res.text()}`);
     }
-    const json = await res.json();
-    return json.data || json;
+    const json = await res.json().catch(() => ({}));
+    return json?.data || json;
   }
 
   const params = {
@@ -938,7 +998,7 @@ export async function replyPermission(sessionId, permissionID, reply, message, d
     const res = await fetch(url, {
       method: 'POST',
       headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ reply, message }),
+      body: JSON.stringify({ decision: reply, message: message || null }),
     });
     if (!res.ok) {
       throw new Error(`replyPermission failed (${permissionID}): HTTP ${res.status}`);
@@ -961,18 +1021,62 @@ export async function replyPermission(sessionId, permissionID, reply, message, d
 /**
  * Reply to a pending question request. `answers` is an ordered array (one
  * element per `data.questions` entry) of selected label arrays
- * (QuestionAnswer = string[]).
- *
- * Uses v1 endpoint `/question/{requestID}/reply` which accepts a `directory`
- * query parameter for server-side project scoping.
+ * (QuestionAnswer = string[]), or a key-value object for v2 forms.
  *
  * @param {string} sessionId
- * @param {string} questionID - the request id from `question.*.asked` `data.id`
- * @param {string[][]} answers
+ * @param {string} questionID - the request id from `question.*.asked` / `form.*.asked`
+ * @param {string[][] | object} answers
  * @param {string} [directory] - project directory for server-side scoping
  * @returns {Promise<void>}
  */
 export async function replyQuestion(sessionId, questionID, answers, directory) {
+  if (serveManager.isV2() && sessionId) {
+    let answerObj = {};
+    if (answers && typeof answers === 'object' && !Array.isArray(answers)) {
+      answerObj = answers;
+    } else {
+      // Fetch form info to map array answers onto form field keys
+      try {
+        const formUrl = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(questionID)}`;
+        const formRes = await fetch(formUrl, { headers: getAuthHeader() });
+        if (formRes.ok) {
+          const formJson = await formRes.json();
+          const form = formJson.data || formJson;
+          const fields = Array.isArray(form.fields) ? form.fields : [];
+          const answersArr = Array.isArray(answers) ? answers : [];
+          fields.forEach((field, idx) => {
+            const val = answersArr[idx];
+            if (val !== undefined) {
+              if (field.type === 'multiselect') {
+                answerObj[field.key] = Array.isArray(val) ? val : [val];
+              } else {
+                answerObj[field.key] = Array.isArray(val) ? val[0] : val;
+              }
+            }
+          });
+        }
+      } catch (err) {
+        console.warn(`[sdk:v2] failed to fetch form info for field mapping:`, err?.message || err);
+      }
+      if (Object.keys(answerObj).length === 0 && Array.isArray(answers)) {
+        answers.forEach((val, idx) => {
+          answerObj[String(idx)] = Array.isArray(val) ? (val.length === 1 ? val[0] : val) : val;
+        });
+      }
+    }
+    const replyUrl = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(questionID)}/reply`;
+    const res = await fetch(replyUrl, {
+      method: 'POST',
+      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer: answerObj }),
+    });
+    if (!res.ok) {
+      throw new Error(`replyQuestion failed (${questionID}): HTTP ${res.status} ${await res.text()}`);
+    }
+    console.error('[DEBUG][OpenCodeDaemon:v2] question form replied ok:', questionID);
+    return;
+  }
+
   const client = getClient();
   const formattedAnswers = Array.isArray(answers) ? answers : [];
 
@@ -1013,6 +1117,19 @@ export async function replyQuestion(sessionId, questionID, answers, directory) {
  * @returns {Promise<void>}
  */
 export async function rejectQuestion(sessionId, questionID, directory) {
+  if (serveManager.isV2() && sessionId) {
+    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(questionID)}`;
+    const res = await fetch(url, {
+      method: 'DELETE',
+      headers: getAuthHeader(),
+    });
+    if (!res.ok && res.status !== 404) {
+      throw new Error(`rejectQuestion failed (${questionID}): HTTP ${res.status} ${await res.text()}`);
+    }
+    console.error('[DEBUG][OpenCodeDaemon:v2] question form rejected ok:', questionID);
+    return;
+  }
+
   const client = getClient();
   if (sessionId && client.session?.question?.reject) {
     console.log(`[sdk] session.question.reject sessionID=${sessionId} requestID=${questionID}`);
@@ -1087,11 +1204,26 @@ export async function listMessages(sessionId, directory, options = {}) {
       throw new Error(`Failed to list messages for session ${sessionId}: HTTP ${res.status}`);
     }
     const json = await res.json();
-    const list = Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []);
+    const list = Array.isArray(json.items)
+      ? json.items
+      : (Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []));
+
+    // OpenCode v2 returns messages in reverse chronological order (newest first).
+    // Sort ascending by time.created/start to guarantee chronological order (oldest first),
+    // matching v1 behavior so that user prompts precede assistant responses.
+    const sortedList = [...list].sort((a, b) => {
+      const ta = (a?.time && (a.time.created || a.time.start)) || 0;
+      const tb = (b?.time && (b.time.created || b.time.start)) || 0;
+      if (ta && tb && ta !== tb) return ta - tb;
+      return 0;
+    });
+    if (list.length > 1 && sortedList.every((item, idx) => item === list[idx])) {
+      sortedList.reverse();
+    }
 
     // Convert v2 messages to v1 { info, parts } entries for host compatibility
     const entries = [];
-    for (const m of list) {
+    for (const m of sortedList) {
       if (!m || typeof m !== 'object') continue;
       if (m.type === 'idle' || m.type === 'compaction') continue;
 
@@ -1143,6 +1275,12 @@ export async function listMessages(sessionId, directory, options = {}) {
                 },
               });
             }
+          }
+        }
+        if (m.error || m.finish === 'error') {
+          const errText = m.error?.message || (typeof m.error === 'string' ? m.error : (m.finish === 'error' ? 'Request ended with error' : ''));
+          if (errText && !parts.some(p => p.type === 'text')) {
+            parts.push({ type: 'text', text: `[Error: ${errText}]` });
           }
         }
       }

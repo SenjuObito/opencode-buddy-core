@@ -441,10 +441,11 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     case 'message.part.delta':
       if (turn) _handlePartDelta(props, turn);
       break;
-    case 'message.updated':
+    case 'message.updated': {
       // Track assistant message info (id/role/tokens/cost) for MESSAGE_END and turn usage aggregation.
       if (turn && props?.info && typeof props.info === 'object') {
-        if (props.info.role === 'assistant') {
+        const isAssistant = props.info.role === 'assistant' || props.info.type === 'assistant';
+        if (isAssistant) {
           turn.lastInfo = props.info;
           if (props.info.id) {
             turn.assistantMessagesMap.set(props.info.id, props.info);
@@ -452,6 +453,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
         }
       }
       break;
+    }
     case 'message.removed':
       // Where a revert actually lands. opencode's revert only writes a "void from
       // here on" pointer; the real deletion happens on the next prompt: the server
@@ -482,13 +484,33 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
         emitJsonStringMarker('[CONTENT_DELTA]', props.delta);
       }
       break;
-    case 'session.usage.updated':
+    case 'session.step.ended': {
       if (turn && props?.tokens && typeof props.tokens === 'object') {
-        turn.lastInfo = {
-          ...(turn.lastInfo || {}),
+        const msgId = props.assistantMessageID || 'default';
+        const info = {
+          id: msgId,
+          type: 'assistant',
+          role: 'assistant',
           tokens: props.tokens,
           cost: props.cost,
         };
+        turn.lastInfo = { ...(turn.lastInfo || {}), ...info };
+        turn.assistantMessagesMap.set(msgId, turn.lastInfo);
+      }
+      break;
+    }
+    case 'session.usage.updated': {
+      if (turn && props?.tokens && typeof props.tokens === 'object') {
+        const msgId = props.assistantMessageID || turn.lastInfo?.id || 'default';
+        turn.lastInfo = {
+          ...(turn.lastInfo || {}),
+          id: msgId,
+          type: 'assistant',
+          role: 'assistant',
+          tokens: props.tokens,
+          cost: props.cost,
+        };
+        turn.assistantMessagesMap.set(msgId, turn.lastInfo);
         const usage = tokensToUsage(props.tokens);
         if (usage) {
           if (typeof props.cost === 'number' && props.cost > 0) {
@@ -498,15 +520,28 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
         }
       }
       break;
+    }
+    case 'session.tool.input.started': {
+      if (turn) {
+        const callID = props.toolID || props.id;
+        const name = props.name || props.tool;
+        if (callID && name) {
+          turn.toolNames.set(callID, name);
+        }
+      }
+      break;
+    }
     case 'session.tool.called':
     case 'session.tool.input': {
       if (turn) {
         const callID = props.toolID || props.id;
-        const name = props.tool || props.name || 'tool';
+        let name = props.name || props.tool || (callID ? turn.toolNames.get(callID) : null) || 'tool';
+        if (name === 'shell') name = 'bash';
         const input = (props.input && typeof props.input === 'object' && !Array.isArray(props.input))
           ? props.input
           : {};
         if (callID) {
+          turn.toolNames.set(callID, name);
           const inputJson = JSON.stringify(input);
           const emittedJson = turn.toolUseInput.get(callID);
           if (emittedJson === undefined || (Object.keys(input).length > 0 && emittedJson !== inputJson)) {
@@ -525,9 +560,33 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
         if (callID && !turn.toolResultDone.has(callID)) {
           turn.toolResultDone.add(callID);
           const isError = type === 'session.tool.failed' || Boolean(props.error);
-          const content = isError ? (props.error || '') : (props.output ?? props.result ?? '');
+          let content = '';
+          if (isError) {
+            content = props.error || '';
+          } else if (Array.isArray(props.content)) {
+            content = props.content.map(c => (typeof c === 'object' && c ? (c.text ?? JSON.stringify(c)) : String(c))).join('\n');
+          } else {
+            content = props.output ?? props.result ?? '';
+          }
           emitToolResultMessage({ toolUseId: callID, content, isError });
         }
+      }
+      break;
+    }
+    case 'session.shell.started':
+      logDebug('session.shell.started:', props?.shell?.id, props?.shell?.command);
+      break;
+    case 'session.shell.ended': {
+      const exitCode = props?.shell?.exit ?? props?.output?.exit ?? 0;
+      const rawOutput = props?.output?.output || props?.output?.stdout || props?.output?.stderr || '';
+      logDebug('session.shell.ended:', props?.shell?.id, 'exit:', exitCode, 'outputLen:', rawOutput.length);
+      if (rawOutput) {
+        emitJsonStringMarker('[CONTENT_DELTA]', rawOutput);
+      } else if (exitCode !== 0) {
+        emitJsonStringMarker('[CONTENT_DELTA]', `Process exited with code ${exitCode}\n`);
+      }
+      if (turn) {
+        _settleTurn(turn, { success: exitCode === 0 });
       }
       break;
     }
@@ -575,10 +634,14 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       emitJsonStringMarker('[PERMISSION_REQUEST]', normalized);
       break;
     }
+    case 'form.created':
+    case 'form.asked':
+    case 'session.form.create':
+    case 'session.form.created':
     case 'question.asked':
     case 'questionV2.asked': {
       const request = normalizeQuestionRequest(props);
-      logDebug('question asked:', request.requestId, 'session:', request.sessionId,
+      logDebug('question/form asked:', request.requestId, 'session:', request.sessionId,
         'tool:', JSON.stringify(request.tool), 'questions:', request.questions.length,
         'rawProps:', JSON.stringify(props).slice(0, 500));
       emitJsonStringMarker('[QUESTION_REQUEST]', request);
@@ -588,14 +651,18 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     // on its own (turn aborted/errored/expired, or answered via another
     // surface). The webview cards must be torn down accordingly or they stay
     // pending forever and later fail with "Question request not found".
+    case 'form.replied':
+    case 'form.discarded':
+    case 'form.deleted':
+    case 'session.form.cancel':
     case 'question.replied':
     case 'question.v2.replied':
     case 'questionV2.replied':
     case 'question.rejected':
     case 'question.v2.rejected':
     case 'questionV2.rejected': {
-      const requestId = props?.requestID ?? props?.id ?? '';
-      logDebug('question closed:', type, requestId);
+      const requestId = props?.requestID ?? props?.formID ?? props?.id ?? '';
+      logDebug('question/form closed:', type, requestId);
       if (requestId) {
         emitJsonStringMarker('[QUESTION_CLOSED]', { requestId });
       }
@@ -766,6 +833,7 @@ function _createTurn(requestId = null) {
     stepTokensMap: new Map(),
     lastInfo: null,
     assistantMessagesMap: new Map(),
+    toolNames: new Map(),
   };
 }
 
@@ -1055,8 +1123,16 @@ export async function sendShellPersistent(params = {}) {
       directory,
     });
 
-    // Wait for session.idle / session.error / abort to settle the turn.
-    await turn.promise;
+    // Wait for session.shell.ended / session.idle / session.error / abort to settle the turn.
+    let timerId = null;
+    const timeoutPromise = new Promise((_, reject) => {
+      timerId = setTimeout(() => reject(new Error('Shell execution timed out after 60s')), 60000);
+    });
+    try {
+      await Promise.race([turn.promise, timeoutPromise]);
+    } finally {
+      if (timerId) clearTimeout(timerId);
+    }
   } catch (err) {
     if (turn.aborted) {
       endStream({ sessionId });
@@ -1198,7 +1274,8 @@ export async function getContextUsagePersistent(params = {}) {
           for (let i = messages.length - 1; i >= 0; i -= 1) {
             const m = messages[i];
             const info = m && typeof m.info === 'object' ? m.info : m;
-            if (info?.role === 'assistant' && info?.tokens) {
+            const isAssistant = info?.role === 'assistant' || info?.type === 'assistant';
+            if (isAssistant && info?.tokens) {
               const cache = info.tokens.cache && typeof info.tokens.cache === 'object' ? info.tokens.cache : {};
               const inp = Number(info.tokens.input) || 0;
               const out = Number(info.tokens.output) || 0;
@@ -1219,7 +1296,9 @@ export async function getContextUsagePersistent(params = {}) {
               for (const p of providers) {
                 if (foundProviderId && p?.id !== foundProviderId) continue;
                 const bareModel = typeof foundModelId === 'string' ? foundModelId.split('/').pop() : '';
-                const mInfo = p?.models?.[foundModelId] || (bareModel ? p?.models?.[bareModel] : null);
+                const mInfo = p?.models?.[foundModelId]
+                  || (bareModel ? p?.models?.[bareModel] : null)
+                  || Object.values(p?.models || {}).find(m => m?.id === foundModelId || m?.id === bareModel || m?.name === foundModelId || m?.name === bareModel);
                 if (mInfo?.limit?.context) {
                   const limit = Number(mInfo.limit.context);
                   if (Number.isFinite(limit) && limit > 0) {
