@@ -84,6 +84,19 @@ const _sseSubPromises = new Map();
 const _activeTurns = new Map();
 /** @type {Map<string, { directory?: string }>} sessionID → session state */
 const _sessions = new Map();
+/**
+ * Sessions whose turn was abandoned locally by the 180s timeout while opencode
+ * was still working on it. Their late `session.error` has no active turn to
+ * settle and MUST NOT be mistaken for a compaction failure — it is the real
+ * reason the turn died, arriving after the UI already gave up. Keyed by
+ * sessionID, consumed (and deleted) by the first matching late error, and
+ * bounded by a TTL so a session that never reports back cannot leak.
+ * @type {Map<string, { at: number }>}
+ */
+const _timedOutTurns = new Map();
+const TIMED_OUT_TURN_TTL_MS = 30 * 60 * 1000;
+/** Local fallback bound for a single turn, from request to settle. */
+const TURN_TIMEOUT_MS = 180_000;
 
 /** session 目录注册表上限：超限按插入序丢最旧（近似 LRU）。条目极小，但
  * 常驻 daemon 生命周期内无界增长没有任何收益。 */
@@ -600,14 +613,36 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     }
     case 'session.status': {
       const status = props?.status;
-      if (status && typeof status === 'object') {
-        if (status.type === 'retry') {
-          const actionMsg = status.action?.message || status.action?.title || '';
-          const retryMsg = status.message || actionMsg || 'OpenCode server rate limit / quota exceeded, retrying...';
-          const fullMsg = actionMsg && actionMsg !== retryMsg ? `${retryMsg} (${actionMsg})` : retryMsg;
-          logInfo(`[session.status:retry] session=${sessionID} msg=${fullMsg}`);
-          emitJsonStringMarker('[STATUS]', fullMsg);
-        }
+      if (status && typeof status === 'object' && status.type === 'retry') {
+        // 结构化透传，而不是拼一段字符串：opencode 的 retry 状态自带人话
+        // (message) 和可点击的 action（free_tier_limit → opencode.ai/go 订阅页，
+        // account_rate_limit → workspace 配额页）。宿主侧原来根本没有 [STATUS]
+        // 分支，这个"到底为什么卡住"的唯一权威信号整条丢失，用户只能干等到
+        // 180s 本地超时，看到"可能由于模型服务繁忙或额度耗尽"这种什么都没说的
+        // 兜底文案。
+        const rawAction = status.action;
+        const action = (rawAction && typeof rawAction === 'object')
+          ? {
+            reason: rawAction.reason ?? null,
+            provider: rawAction.provider ?? null,
+            title: rawAction.title ?? null,
+            message: rawAction.message ?? null,
+            label: rawAction.label ?? null,
+            link: rawAction.link ?? null,
+          }
+          : null;
+        const payload = {
+          sessionID: sessionID || '',
+          type: 'retry',
+          message: status.message || action?.message || 'OpenCode server rate limit / quota exceeded, retrying...',
+          attempt: typeof status.attempt === 'number' ? status.attempt : null,
+          next: typeof status.next === 'number' ? status.next : null,
+          action,
+        };
+        // 记在本回合上：180s 兜底文案要带上服务端的原话，而不是继续瞎猜。
+        if (turn) turn.lastStatusMessage = payload.message;
+        logInfo(`[session.status:retry] session=${sessionID} attempt=${payload.attempt} reason=${action?.reason || '-'} msg=${payload.message}`);
+        emitJsonStringMarker('[STATUS]', payload);
       }
       break;
     }
@@ -636,12 +671,26 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       // 同样走 marker，宿主按 sessionID + pending 状态过滤。有 active turn
       // 时错误属于当前对话 turn，不能误报为压缩失败。
       if (!turn) {
-        logDebug(`${type} (no turn):`, sessionID || '', JSON.stringify(err).substring(0, 200));
-        emitJsonStringMarker('[SESSION_COMPACT_RESULT]', JSON.stringify({
-          sessionID: sessionID || props?.info?.id || '',
-          success: false,
-          error: err?.message || String(err),
-        }));
+        const timedOut = sessionID ? _timedOutTurns.get(sessionID) : null;
+        if (timedOut && Date.now() - timedOut.at < TIMED_OUT_TURN_TTL_MS) {
+          // 本地 180s 超时已经替这个会话报过一次失败了，这是服务端迟到的真实
+          // 原因。它绝不能走 [SESSION_COMPACT_RESULT]——那条通道宿主只打一行
+          // log 就丢了，等于把"额度耗尽"这类唯一有解释力的信息二次掩埋。
+          _timedOutTurns.delete(sessionID);
+          logDebug(`${type} after local timeout:`, sessionID, JSON.stringify(err).substring(0, 200));
+          emitJsonStringMarker('[TURN_ERROR]', {
+            sessionID: sessionID || '',
+            message: err?.message || String(err),
+            source: 'late-after-timeout',
+          });
+        } else {
+          logDebug(`${type} (no turn):`, sessionID || '', JSON.stringify(err).substring(0, 200));
+          emitJsonStringMarker('[SESSION_COMPACT_RESULT]', JSON.stringify({
+            sessionID: sessionID || props?.info?.id || '',
+            success: false,
+            error: err?.message || String(err),
+          }));
+        }
       }
       break;
     }
@@ -865,6 +914,8 @@ function _createTurn(requestId = null) {
     lastInfo: null,
     assistantMessagesMap: new Map(),
     toolNames: new Map(),
+    // 最近一次 session.status:retry 的人话原因，供 180s 兜底文案引用。
+    lastStatusMessage: null,
   };
 }
 
@@ -1056,12 +1107,31 @@ export async function sendMessagePersistent(params = {}) {
     turn.reject = reject;
   });
   _activeTurns.set(sessionId, turn);
+  // 新回合开始，上一个"本地超时"登记作废——否则它的迟到错误会被错记到本回合。
+  _timedOutTurns.delete(sessionId);
 
   logDebug(
     `send session=${sessionId} agent=${agent || '-'} model=${safeParams.model || '-'}`
     + ` command=${validSlashCommand || '-'} attachments=${fileParts.length}`
     + ` skipped=${attachmentErrors.length} promptLen=${promptText.length}`
   );
+
+  // 超时兜底必须在**发起请求之前**建好计时器。原来它是在 `await
+  // sdk.promptAsync()` 之后才创建的，于是 promptAsync 自身挂住（连接建立后
+  // 不再返回）时，`Promise.race` 根本没机会执行，180s 兜底形同虚设——这正是
+  // "一直转、什么都不报"的最长路径。
+  let turnTimer = null;
+  let timedOut = false;
+  const timeoutPromise = new Promise((_, reject) => {
+    turnTimer = setTimeout(() => {
+      timedOut = true;
+      // 文案带上服务端已经给过的原话（额度/限流原因），没有才退回泛化描述。
+      const detail = turn.lastStatusMessage
+        ? `服务端返回：${turn.lastStatusMessage}`
+        : '服务端在此期间未返回任何状态';
+      reject(new Error(`OpenCode 请求等待超时 (${Math.round(TURN_TIMEOUT_MS / 1000)}s)。${detail}`));
+    }, TURN_TIMEOUT_MS);
+  });
 
   try {
     if (validSlashCommand) {
@@ -1087,19 +1157,14 @@ export async function sendMessagePersistent(params = {}) {
       });
     }
 
-    // Wait for session.idle / session.error / abort to settle the turn with 180s timeout protection.
-    let turnTimer = null;
-    const timeoutPromise = new Promise((_, reject) => {
-      turnTimer = setTimeout(() => {
-        reject(new Error('OpenCode 请求等待超时 (180s)，可能由于模型服务繁忙或额度耗尽'));
-      }, 180000);
-    });
-    try {
-      await Promise.race([turn.promise, timeoutPromise]);
-    } finally {
-      if (turnTimer) clearTimeout(turnTimer);
-    }
+    // Wait for session.idle / session.error / abort to settle the turn.
+    await Promise.race([turn.promise, timeoutPromise]);
   } catch (err) {
+    // 本地超时后服务端的真实失败仍会迟到。登记该会话，让迟到的
+    // session.error 走 [TURN_ERROR] 而不是被当成压缩结果丢掉。
+    if (timedOut && !turn.aborted) {
+      _timedOutTurns.set(sessionId, { at: Date.now() });
+    }
     if (turn.aborted) {
       // Graceful abort — clean "interrupted" result, no error toast.
       endStream({ sessionId });
@@ -1123,6 +1188,7 @@ export async function sendMessagePersistent(params = {}) {
     emitSendError(message, 'OpenCode');
     return;
   } finally {
+    if (turnTimer) clearTimeout(turnTimer);
     _activeTurns.delete(sessionId);
     // 本回合产生了新的 token 用量，context usage 缓存失效。
     _contextUsageCache.delete(`${sessionId}::${directory || ''}`);
@@ -1291,11 +1357,19 @@ export async function preconnectPersistent(params = {}) {
  * @param {string} [targetSessionId] - Optional session ID to abort. If omitted, aborts all active turns.
  */
 export async function abortCurrentTurn(targetSessionId) {
-  const sessions = (targetSessionId && _activeTurns.has(targetSessionId))
-    ? [targetSessionId]
-    : targetSessionId
-      ? [targetSessionId] // 只要指定了 targetSessionId，即使 _activeTurns 没命中（或还在排队初始化），也无条件通知底层服务端 abort
-      : [..._activeTurns.keys()];
+  // 防御：opencode 只接受 `ses_*` 形式的 session id，其它值会被服务端以
+  // `Expected a string starting with "ses"` 拒绝。而这里的失败是静默的
+  // （catch 里只 logDebug），对外表现为「UI 已经停止 loading、服务端仍在重试」。
+  // 历史上 channelId（随机 UUID）正是从这个口子进来的，所以在此收口：
+  // 非 `ses_` 的目标一律降级为「中止所有活跃 turn」。
+  let target = typeof targetSessionId === 'string' ? targetSessionId.trim() : '';
+  if (target && !target.startsWith('ses')) {
+    logDebug(`abort: non-session target "${target}" ignored (expected ses_*); falling back to all active turns`);
+    target = '';
+  }
+  const sessions = target
+    ? [target] // 只要指定了 target，即使 _activeTurns 没命中（或还在排队初始化），也无条件通知底层服务端 abort
+    : [..._activeTurns.keys()];
   if (sessions.length === 0) return;
   for (const sessionId of sessions) {
     const turn = _activeTurns.get(sessionId);
