@@ -312,3 +312,79 @@ export function probeCliVersion(binaryPath, env = process.env) {
   }
 }
 
+/**
+ * Detect available OpenCode CLI binaries on the system and deterministically
+ * select the engine mode (v1 or v2).
+ * Priority rule:
+ * - If v2 is found (or both v1 and v2 exist), prioritize and lock to v2.
+ * - If only v1 is found, lock to v1.
+ * - If no CLI is found, return null binary and default isV2: false.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {{ binary: string | null, version: string | null, isV2: boolean }}
+ */
+export function detectCliBinAndEngineMode(env = process.env) {
+  const probeEnv = { ...env };
+  enrichPathWithBinDirs(probeEnv, commonCliBinDirs(homedir()));
+
+  const home = homedir();
+  const rawCandidates = [
+    process.env.OPENCODE_BIN,
+    process.env.OPENCODE_PATH,
+    process.env.OPENCODE_CLI_PATH,
+    resolveOpenCodeCliPath(),
+    process.platform === 'win32' ? null : '/usr/local/bin/opencode',
+    join(home, '.opencode', 'bin', process.platform === 'win32' ? 'opencode.cmd' : 'opencode'),
+    join(home, '.local', 'share', 'opencode', 'bin', process.platform === 'win32' ? 'opencode.cmd' : 'opencode'),
+    join(home, '.local', 'bin', process.platform === 'win32' ? 'opencode.cmd' : 'opencode'),
+  ].filter(Boolean);
+
+  const seen = new Set();
+  const candidates = [];
+  for (const c of rawCandidates) {
+    if (!seen.has(c) && pathExists(c)) {
+      seen.add(c);
+      candidates.push(c);
+    }
+  }
+
+  let selectedV2 = null;
+  let fallbackV1 = null;
+
+  for (const bin of candidates) {
+    const ver = probeCliVersion(bin, probeEnv);
+    if (!ver) continue;
+    const isV2 = !ver.startsWith('1.');
+    if (isV2) {
+      selectedV2 = { binary: bin, version: ver, isV2: true };
+      break; // Found v2; prioritized!
+    } else if (!fallbackV1) {
+      fallbackV1 = { binary: bin, version: ver, isV2: false };
+    }
+  }
+
+  if (selectedV2) {
+    return selectedV2;
+  }
+  if (fallbackV1) {
+    return fallbackV1;
+  }
+
+  // Bare command fallback
+  const bareBin = resolveOpenCodeCliPath();
+  const bareVer = probeCliVersion(bareBin, probeEnv);
+  if (bareVer) {
+    return {
+      binary: bareBin,
+      version: bareVer,
+      isV2: !bareVer.startsWith('1.'),
+    };
+  }
+
+  return {
+    binary: null,
+    version: null,
+    isV2: false,
+  };
+}
+

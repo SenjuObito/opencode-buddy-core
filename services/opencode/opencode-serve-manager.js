@@ -23,6 +23,7 @@ import {
   enrichPathWithBinDirs,
   probeSystemNode,
   probeCliVersion,
+  detectCliBinAndEngineMode,
 } from '../../utils/cli-path.js';
 import { logInfo, logWarn, logError, logDebug } from '../../utils/logger.js';
 
@@ -30,7 +31,10 @@ import { logInfo, logWarn, logError, logDebug } from '../../utils/logger.js';
 let _process = null;
 let _serverUrl = null;
 let _serverPassword = process.env.OPENCODE_SERVER_PASSWORD || process.env.OPENCODE_PASSWORD || null;
-let _isV2 = true;
+let _isV2 = false;
+let _engineInitialized = false;
+let _selectedBinary = null;
+let _detectedCliVersion = null;
 /** @type {Promise<string> | null} */
 let _startPromise = null;
 /** Last port passed to start(), so an auto-restart rebinds the same port the
@@ -117,9 +121,52 @@ export function getServerPassword() {
 }
 
 /**
+ * Synchronously determine and lock the engine mode (v1 or v2) at boot time.
+ * If both v1 and v2 exist, v2 is prioritized.
+ * Once locked, the mode remains deterministic for the process lifetime.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {{ isV2: boolean, version: string | null, binary: string | null }}
+ */
+export function initEngineMode(env = process.env) {
+  if (_engineInitialized) {
+    return {
+      isV2: _isV2,
+      version: _detectedCliVersion,
+      binary: _selectedBinary,
+    };
+  }
+  const detected = detectCliBinAndEngineMode(env);
+  _isV2 = detected.isV2;
+  _detectedCliVersion = detected.version;
+  _selectedBinary = detected.binary;
+  _engineInitialized = true;
+
+  logInfo('opencode-serve-manager:init', `Engine mode locked at startup: isV2=${_isV2} (CLI version: ${_detectedCliVersion || 'unknown'}, binary: ${_selectedBinary || 'none'})`);
+  return {
+    isV2: _isV2,
+    version: _detectedCliVersion,
+    binary: _selectedBinary,
+  };
+}
+
+/**
+ * @returns {string | null} Detected CLI version, if any.
+ */
+export function getDetectedCliVersion() {
+  if (!_engineInitialized) {
+    initEngineMode();
+  }
+  return _detectedCliVersion;
+}
+
+/**
  * @returns {boolean} Whether the running opencode server is v2.
  */
 export function isV2() {
+  if (!_engineInitialized) {
+    initEngineMode();
+  }
   return _isV2;
 }
 
@@ -174,6 +221,9 @@ function isExecutable(filePath) {
  * @returns {Promise<string | null>} Absolute path, or null if not found.
  */
 export async function findBinary() {
+  if (_engineInitialized && _selectedBinary) {
+    return _selectedBinary;
+  }
   const resolved = resolveOpenCodeCliPath();
   if (!resolved) return null;
   // Bare command name (no path, no drive): cannot F_OK-check against cwd.
@@ -295,8 +345,10 @@ async function doStart(port) {
   enrichPathWithBinDirs(spawnEnv, commonCliBinDirs(homedir()));
 
   const systemNode = probeSystemNode(spawnEnv);
-  const cliVersion = probeCliVersion(binary, spawnEnv);
-  _isV2 = !cliVersion || !cliVersion.startsWith('1.');
+  const cliVersion = _detectedCliVersion || probeCliVersion(binary, spawnEnv);
+  if (!_engineInitialized) {
+    initEngineMode(spawnEnv);
+  }
 
   if (_isV2) {
     if (!_serverPassword) {

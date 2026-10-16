@@ -378,7 +378,13 @@ function _handleEvent(evt) {
     ? evt.properties
     : ((evt && evt.data && typeof evt.data === 'object') ? evt.data : {});
   const type = typeof evt?.type === 'string' ? evt.type : '';
-  const sessionID = props?.sessionID;
+  const sessionID = props?.sessionID
+    || props?.sessionId
+    || props?.session_id
+    || evt?.sessionID
+    || evt?.sessionId
+    || evt?.properties?.sessionID
+    || evt?.data?.sessionID;
   const turn = sessionID ? _activeTurns.get(sessionID) : null;
   if (turn) {
     turn.lastActivityAt = Date.now();
@@ -523,7 +529,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     }
     case 'session.tool.input.started': {
       if (turn) {
-        const callID = props.toolID || props.id;
+        const callID = _resolveToolCallId(props, turn);
         const name = props.name || props.tool;
         if (callID && name) {
           turn.toolNames.set(callID, name);
@@ -534,7 +540,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     case 'session.tool.called':
     case 'session.tool.input': {
       if (turn) {
-        const callID = props.toolID || props.id;
+        const callID = _resolveToolCallId(props, turn);
         let name = props.name || props.tool || (callID ? turn.toolNames.get(callID) : null) || 'tool';
         if (name === 'shell') name = 'bash';
         const input = (props.input && typeof props.input === 'object' && !Array.isArray(props.input))
@@ -556,7 +562,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     case 'session.tool.success':
     case 'session.tool.failed': {
       if (turn) {
-        const callID = props.toolID || props.id;
+        const callID = _resolveToolCallId(props, turn);
         if (callID && !turn.toolResultDone.has(callID)) {
           turn.toolResultDone.add(callID);
           const isError = type === 'session.tool.failed' || Boolean(props.error);
@@ -580,13 +586,28 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       const exitCode = props?.shell?.exit ?? props?.output?.exit ?? 0;
       const rawOutput = props?.output?.output || props?.output?.stdout || props?.output?.stderr || '';
       logDebug('session.shell.ended:', props?.shell?.id, 'exit:', exitCode, 'outputLen:', rawOutput.length);
-      if (rawOutput) {
-        emitJsonStringMarker('[CONTENT_DELTA]', rawOutput);
-      } else if (exitCode !== 0) {
-        emitJsonStringMarker('[CONTENT_DELTA]', `Process exited with code ${exitCode}\n`);
+      if (!turn || turn.toolUseDone.size === 0) {
+        if (rawOutput) {
+          emitJsonStringMarker('[CONTENT_DELTA]', rawOutput);
+        } else if (exitCode !== 0) {
+          emitJsonStringMarker('[CONTENT_DELTA]', `Process exited with code ${exitCode}\n`);
+        }
       }
       if (turn) {
         _settleTurn(turn, { success: exitCode === 0 });
+      }
+      break;
+    }
+    case 'session.status': {
+      const status = props?.status;
+      if (status && typeof status === 'object') {
+        if (status.type === 'retry') {
+          const actionMsg = status.action?.message || status.action?.title || '';
+          const retryMsg = status.message || actionMsg || 'OpenCode server rate limit / quota exceeded, retrying...';
+          const fullMsg = actionMsg && actionMsg !== retryMsg ? `${retryMsg} (${actionMsg})` : retryMsg;
+          logInfo(`[session.status:retry] session=${sessionID} msg=${fullMsg}`);
+          emitJsonStringMarker('[STATUS]', fullMsg);
+        }
       }
       break;
     }
@@ -627,6 +648,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     // Permission / question prompts — normalize v1+v2 event shapes into a
     // canonical payload the host can hand straight to the webview dialogs.
     case 'permission.asked':
+    case 'permission.v2.asked':
     case 'permissionV2.asked':
     case 'permission.requested': {
       const normalized = normalizePermissionRequest(props);
@@ -639,6 +661,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     case 'session.form.create':
     case 'session.form.created':
     case 'question.asked':
+    case 'question.v2.asked':
     case 'questionV2.asked': {
       const request = normalizeQuestionRequest(props);
       logDebug('question/form asked:', request.requestId, 'session:', request.sessionId,
@@ -735,8 +758,12 @@ function _handlePartDelta(props, turn) {
  * `tool_result` (when it reaches a terminal state).
  */
 export function _handleToolPart(part, turn) {
-  const callID = part.callID || part.id;
-  const name = part.tool || part.name || 'tool';
+  const callID = _resolveToolCallId(part, turn);
+  let name = part.tool || part.name || 'tool';
+  if (name === 'shell') name = 'bash';
+  if (callID && turn?.toolNames) {
+    turn.toolNames.set(callID, name);
+  }
   const state = (part.state && typeof part.state === 'object') ? part.state : {};
   const status = typeof state.status === 'string' ? state.status : '';
   // opencode 的 tool part 生命周期里 state.input 有三种形态：
@@ -804,6 +831,8 @@ function _settleTurn(turn, { success, error }) {
       : typeof error === 'string' ? error
       : typeof error?.message === 'string' ? error.message
       : typeof error?.data?.message === 'string' ? error.data.message
+      : typeof error?.data?.responseBody === 'string' ? error.data.responseBody
+      : typeof error?.responseBody === 'string' ? error.responseBody
       : typeof error?.error === 'string' ? error.error
       : typeof error?.error?.message === 'string' ? error.error.message
       : JSON.stringify(error);
@@ -824,6 +853,8 @@ function _createTurn(requestId = null) {
     reject: null,
     aborted: false,
     parts: new Map(),
+    toolPartToCallMap: new Map(),
+    toolCallToPartMap: new Map(),
     toolUseDone: new Set(),
     // callID → 已发出的 tool_use input 的 JSON 快照。用于判断参数是否已
     // 从 pending 的空值晋级为真正的对象，从而决定是否需要补发。
@@ -835,6 +866,30 @@ function _createTurn(requestId = null) {
     assistantMessagesMap: new Map(),
     toolNames: new Map(),
   };
+}
+
+export function _resolveToolCallId(propsOrPart, turn) {
+  if (!propsOrPart) return 'tool-1';
+  const explicitCallId = propsOrPart.callID || propsOrPart.callId || propsOrPart.toolID || propsOrPart.toolId || propsOrPart.state?.callID;
+  const partId = propsOrPart.id;
+
+  if (turn) {
+    if (explicitCallId && partId) {
+      turn.toolPartToCallMap?.set(partId, explicitCallId);
+      turn.toolCallToPartMap?.set(explicitCallId, partId);
+      return explicitCallId;
+    }
+    if (explicitCallId) {
+      return explicitCallId;
+    }
+    if (partId) {
+      if (turn.toolPartToCallMap?.has(partId)) {
+        return turn.toolPartToCallMap.get(partId);
+      }
+      return partId;
+    }
+  }
+  return explicitCallId || partId || 'tool-1';
 }
 
 // =============================================================================
@@ -1032,8 +1087,18 @@ export async function sendMessagePersistent(params = {}) {
       });
     }
 
-    // Wait for session.idle / session.error / abort to settle the turn.
-    await turn.promise;
+    // Wait for session.idle / session.error / abort to settle the turn with 180s timeout protection.
+    let turnTimer = null;
+    const timeoutPromise = new Promise((_, reject) => {
+      turnTimer = setTimeout(() => {
+        reject(new Error('OpenCode 请求等待超时 (180s)，可能由于模型服务繁忙或额度耗尽'));
+      }, 180000);
+    });
+    try {
+      await Promise.race([turn.promise, timeoutPromise]);
+    } finally {
+      if (turnTimer) clearTimeout(turnTimer);
+    }
   } catch (err) {
     if (turn.aborted) {
       // Graceful abort — clean "interrupted" result, no error toast.
@@ -1046,7 +1111,13 @@ export async function sendMessagePersistent(params = {}) {
     let message = rawMsg;
     try {
       const parsed = JSON.parse(rawMsg);
-      message = parsed?.message || parsed?.data?.message || parsed?.error?.message || rawMsg;
+      message = parsed?.message
+        || parsed?.data?.message
+        || parsed?.data?.responseBody
+        || parsed?.responseBody
+        || parsed?.error?.message
+        || parsed?.error
+        || rawMsg;
     } catch { /* not JSON, keep raw */ }
     console.log(JSON.stringify({ success: false, error: message, elapsedMs: Date.now() - startedAt }));
     emitSendError(message, 'OpenCode');
@@ -1223,7 +1294,7 @@ export async function abortCurrentTurn(targetSessionId) {
   const sessions = (targetSessionId && _activeTurns.has(targetSessionId))
     ? [targetSessionId]
     : targetSessionId
-      ? [] // 指定了不存在的 session，无需全局误杀
+      ? [targetSessionId] // 只要指定了 targetSessionId，即使 _activeTurns 没命中（或还在排队初始化），也无条件通知底层服务端 abort
       : [..._activeTurns.keys()];
   if (sessions.length === 0) return;
   for (const sessionId of sessions) {

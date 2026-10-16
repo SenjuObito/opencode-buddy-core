@@ -580,12 +580,21 @@ async function runDaemonMain() {
     platform: process.platform,
   });
 
+  // Deterministically detect and lock engine mode (v1 or v2) at boot time
+  const engine = serveManager.initEngineMode();
+  _originalStderrWrite(
+    `[daemon] Engine mode determined at boot: isV2=${engine.isV2} (version=${engine.version || 'none'}, binary=${engine.binary || 'none'})\n`,
+    'utf8'
+  );
+
   // Pre-load SDK
   await preloadSdks();
 
   // Signal ready
   sendDaemonEvent('ready', {
     pid: process.pid,
+    engineMode: engine.isV2 ? 'v2' : 'v1',
+    cliVersion: engine.version,
     sdkPreloaded,
   });
 

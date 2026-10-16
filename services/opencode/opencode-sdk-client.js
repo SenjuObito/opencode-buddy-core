@@ -507,33 +507,53 @@ export async function shellAsync(sessionId, command, options = {}) {
     ? options.agent.trim()
     : 'build';
 
-  if (serveManager.isV2()) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/shell`;
-    const body = { command, agent };
-    if (options.model) body.model = options.model;
-    const res = await fetch(url, {
+  const baseUrl = _baseUrl || 'http://localhost:4096';
+  const isV2Server = serveManager.isV2();
+
+  // OpenCode REST API routing:
+  // v2 API: /session/{sessionID}/shell (no /api prefix)
+  // v1 API: /api/session/{sessionId}/shell (with /api prefix)
+  const primaryUrl = isV2Server
+    ? `${baseUrl}/session/${encodeURIComponent(sessionId)}/shell`
+    : `${baseUrl}/api/session/${encodeURIComponent(sessionId)}/shell`;
+  const fallbackUrl = isV2Server
+    ? `${baseUrl}/api/session/${encodeURIComponent(sessionId)}/shell`
+    : `${baseUrl}/session/${encodeURIComponent(sessionId)}/shell`;
+
+  const body = { command, agent };
+  if (options.model) body.model = options.model;
+  if (options.directory) body.directory = options.directory;
+
+  const tryRequest = async (url) => {
+    return await fetch(url, {
       method: 'POST',
       headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    if (!res.ok) {
+  };
+
+  let res = await tryRequest(primaryUrl);
+  const contentType = res.headers.get('content-type') || '';
+
+  // If 404 Not Found, 405 Method Not Allowed, or received HTML fallback (SPA route fallback), retry fallback URL
+  if (!res.ok || contentType.includes('text/html')) {
+    console.warn(`[opencode-sdk-client] shellAsync primary url (${primaryUrl}) status=${res.status}, retrying fallback url (${fallbackUrl})`);
+    try {
+      const fallbackRes = await tryRequest(fallbackUrl);
+      const fbContentType = fallbackRes.headers.get('content-type') || '';
+      if (fallbackRes.ok && !fbContentType.includes('text/html')) {
+        return;
+      }
+      if (fallbackRes.ok && fbContentType.includes('text/html')) {
+        throw new Error(`Shell endpoint returned HTML (SPA fallback) on both primary and fallback routes`);
+      }
+      throw new Error(`Shell failed: HTTP ${fallbackRes.status} ${await fallbackRes.text()}`);
+    } catch (fbErr) {
+      if (res.ok && contentType.includes('text/html')) {
+        throw new Error(`Shell endpoint not found on OpenCode server: ${fbErr.message}`);
+      }
       throw new Error(`Shell failed: HTTP ${res.status} ${await res.text()}`);
     }
-    return;
-  }
-
-  const params = {
-    sessionID: sessionId,
-    command,
-    agent,
-  };
-  if (options.model) params.model = options.model;
-  if (options.directory) params.directory = options.directory;
-
-  console.error('[opencode-sdk-client] shell:', JSON.stringify(params));
-  const result = await getClient().session.shell(params);
-  if (result.error) {
-    throw new Error(`Shell failed: ${JSON.stringify(result.error)}`);
   }
 }
 
@@ -1117,19 +1137,6 @@ export async function replyQuestion(sessionId, questionID, answers, directory) {
  * @returns {Promise<void>}
  */
 export async function rejectQuestion(sessionId, questionID, directory) {
-  if (serveManager.isV2() && sessionId) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(questionID)}`;
-    const res = await fetch(url, {
-      method: 'DELETE',
-      headers: getAuthHeader(),
-    });
-    if (!res.ok && res.status !== 404) {
-      throw new Error(`rejectQuestion failed (${questionID}): HTTP ${res.status} ${await res.text()}`);
-    }
-    console.error('[DEBUG][OpenCodeDaemon:v2] question form rejected ok:', questionID);
-    return;
-  }
-
   const client = getClient();
   if (sessionId && client.session?.question?.reject) {
     console.log(`[sdk] session.question.reject sessionID=${sessionId} requestID=${questionID}`);
@@ -1191,7 +1198,10 @@ function summarizeError(error) {
  */
 export async function listMessages(sessionId, directory, options = {}) {
   if (serveManager.isV2()) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/message`;
+    // OpenCode REST API routing:
+    // Full messages endpoint is /session/{id}/message (without /api prefix).
+    // /api/session/{id}/message is a paginated cursor endpoint which returns {"data":[]} without cursor args.
+    const url = `${_baseUrl || 'http://localhost:4096'}/session/${encodeURIComponent(sessionId)}/message`;
     let res;
     try {
       res = await fetch(url, { headers: getAuthHeader() });
@@ -1212,8 +1222,12 @@ export async function listMessages(sessionId, directory, options = {}) {
     // Sort ascending by time.created/start to guarantee chronological order (oldest first),
     // matching v1 behavior so that user prompts precede assistant responses.
     const sortedList = [...list].sort((a, b) => {
-      const ta = (a?.time && (a.time.created || a.time.start)) || 0;
-      const tb = (b?.time && (b.time.created || b.time.start)) || 0;
+      const ta = (a?.time && (a.time.created || a.time.start))
+        || (a?.info?.time && (a.info.time.created || a.info.time.start))
+        || 0;
+      const tb = (b?.time && (b.time.created || b.time.start))
+        || (b?.info?.time && (b.info.time.created || b.info.time.start))
+        || 0;
       if (ta && tb && ta !== tb) return ta - tb;
       return 0;
     });
@@ -1221,10 +1235,24 @@ export async function listMessages(sessionId, directory, options = {}) {
       sortedList.reverse();
     }
 
-    // Convert v2 messages to v1 { info, parts } entries for host compatibility
+    // Convert/normalize v2 messages to standard { info, parts } entries for host compatibility
     const entries = [];
     for (const m of sortedList) {
       if (!m || typeof m !== 'object') continue;
+
+      // Case A: Server already returned standard { info, parts } format
+      if (m.info && typeof m.info === 'object' && Array.isArray(m.parts)) {
+        entries.push({
+          info: {
+            ...m.info,
+            sessionID: m.info.sessionID || sessionId,
+          },
+          parts: m.parts,
+        });
+        continue;
+      }
+
+      // Case B: Flattened format { type, text, content, ... }
       if (m.type === 'idle' || m.type === 'compaction') continue;
 
       const role = m.type === 'user' ? 'user' : (m.type === 'assistant' ? 'assistant' : m.type);
@@ -1272,6 +1300,7 @@ export async function listMessages(sessionId, directory, options = {}) {
                   input: c.input || c.state?.input || {},
                   output: c.output || c.state?.output || '',
                   error: c.error || c.state?.error,
+                  metadata: c.metadata || c.state?.metadata,
                 },
               });
             }

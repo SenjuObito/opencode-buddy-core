@@ -19,6 +19,7 @@ function createTurn() {
     toolUseDone: new Set(),
     toolUseInput: new Map(),
     toolResultDone: new Set(),
+    toolNames: new Map(),
   };
 }
 
@@ -105,4 +106,18 @@ test('tool part — 参数就绪后不会被后续空值状态降级', () => {
 
   assert.equal(emitted.length, 1);
   assert.deepEqual(emitted[0].input, EDIT_INPUT, '已就绪的参数不应被空 input 覆盖');
+});
+
+test('tool part — shell 工具名被归一化为 bash', () => {
+  const turn = createTurn();
+  const part = { id: 'prt_shell_1', callID: 'call_shell_1', type: 'tool', tool: 'shell', state: {} };
+
+  const emitted = collectToolUseInputs(() => {
+    part.state = { status: 'running', input: { command: 'pwd' } };
+    _handleToolPart(part, turn);
+  });
+
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].name, 'bash', 'shell 工具名应归一化为 bash');
+  assert.deepEqual(emitted[0].input, { command: 'pwd' });
 });
