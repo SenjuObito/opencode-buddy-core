@@ -53,6 +53,24 @@ export function endStream({ sessionId, message } = {}) {
 }
 
 /**
+ * Emit the session-scoped, idempotent terminal event for a turn.
+ *
+ * This is the authoritative "the turn is over" signal (INV-C). Unlike the
+ * `[STREAM_END]` data-plane marker it carries `sessionId` + `turnId` in the
+ * payload, so the receiver can clear the right session's running state even
+ * when that session is not the active one — and can ignore a duplicate/late
+ * one for a turn it has already settled.
+ *
+ * `reason` values: 'idle' | 'aborted' | 'error' | 'timeout' | 'disconnected'.
+ *
+ * @param {{ sessionId: string, turnId?: number|null, reason?: string }} info
+ */
+export function emitTurnEnd({ sessionId, turnId = null, reason = 'idle' } = {}) {
+  if (!sessionId) return;
+  console.log(`[TURN_END] ${JSON.stringify({ sessionId, turnId, reason })}`);
+}
+
+/**
  * Emit Claude-compatible tool_use / tool_result MESSAGE markers.
  */
 export function emitToolUseMessage({ id, name, input }) {

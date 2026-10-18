@@ -11,7 +11,7 @@
  *     defaultModel?: 'provider/model' }
  *
  * `contextWindow` mirrors models.dev `limit.context` (the model's total context
- * window). It is only known on the SDK path �? the legacy `opencode models`
+ * window). It is only known on the SDK path �? the legacy `opencode models`
  * stdout fallback carries no limit metadata, so entries omit the field there.
  */
 
@@ -26,6 +26,7 @@ import {
 } from '../../utils/cli-path.js';
 import { selectWorkingDirectory } from '../../utils/path-utils.js';
 import * as serveManager from './opencode-serve-manager.js';
+import * as engineRegistry from './engine-registry.js';
 import * as sdk from './opencode-sdk-client.js';
 
 const DEFAULT_PORT = Number(process.env.OPENCODE_PORT) || 4096;
@@ -38,7 +39,7 @@ export function formatLabel(fullId) {
   const trimmed = String(fullId || '').trim();
   if (!trimmed) return 'OpenCode';
   const slash = trimmed.indexOf('/');
-  // UI 已按供应商分组，label 只显示模型名；id 仍保留完�? provider/model�?
+  // UI 已按供应商分组，label 只显示模型名；id 仍保留完�? provider/model�?
   const modelName = slash > 0 ? trimmed.slice(slash + 1) : trimmed;
   if (!modelName) return trimmed;
   // Title-case-ish for display.
@@ -138,17 +139,34 @@ export function buildSdkModelEntry(providerId, providerName, modelId, modelInfo)
   const description = (modelInfo && typeof modelInfo === 'object' && modelInfo.name)
     ? modelInfo.name
     : `${providerName} ${modelId}`;
-  // opencode variants = 推理力度档位（按模型变化），供前端动态渲染�?
+  // opencode variants = 推理力度档位（按模型变化），供前端动态渲染。
+  //
+  // Three states matter and must stay distinguishable:
+  //   - `['low','high']`  explicit list
+  //   - `[]`              this model has NO variants (opencode v2 reports an
+  //                       empty array/object) → the UI must hide the selector
+  //   - `undefined`       unknown (opencode v1 has no such field) → the UI keeps
+  //                       its legacy hard-coded options
+  // Collapsing the empty case into `undefined` (the previous behaviour) made
+  // "this model has none" look identical to "we don't know", so the UI offered
+  // `high` for models that reject it and every send failed with
+  // `Variant unavailable`.
   let variants;
-  if (modelInfo && typeof modelInfo.variants === 'object' && modelInfo.variants !== null) {
-    variants = Object.keys(modelInfo.variants).filter((key) => {
-      const cfg = modelInfo.variants[key];
+  const rawVariants = (modelInfo && typeof modelInfo === 'object')
+    ? modelInfo.variants
+    : undefined;
+  if (Array.isArray(rawVariants)) {
+    variants = rawVariants
+      .map((v) => (typeof v === 'string' ? v : v && v.id))
+      .filter((id) => typeof id === 'string' && id.length > 0);
+  } else if (rawVariants && typeof rawVariants === 'object') {
+    variants = Object.keys(rawVariants).filter((key) => {
+      const cfg = rawVariants[key];
       return !(cfg && typeof cfg === 'object' && cfg.disabled);
     });
-    if (variants.length === 0) variants = undefined;
   }
-  // 上下文额度（models.dev limit.context）必须一路带�? Java 侧，
-  // 否则模型切换/用量环只能退回硬编码表，1M 模型会被显示�? 200k�?
+  // 上下文额度（models.dev limit.context）必须一路带�? Java 侧，
+  // 否则模型切换/用量环只能退回硬编码表，1M 模型会被显示�? 200k�?
   const contextWindow = resolveContextWindow(modelInfo);
   return {
     id: fullId,
@@ -196,6 +214,11 @@ async function listModelsFromSdk(directory) {
  * through opencode-daemon-service's private `_ensureReady`.
  */
 export async function ensureServerReady() {
+  // Gate on a verified engine mode before any SDK call — the model list is
+  // fetched through v1/v2-specific routes, and this was the exact path that
+  // produced `[OpenCodeModels] SDK provider list failed: Request is not
+  // supported by this version of OpenCode Server`.
+  await engineRegistry.ensure();
   await serveManager.start(DEFAULT_PORT);
   sdk.setBaseUrl(serveManager.getServerUrl() || `http://localhost:${DEFAULT_PORT}`);
 }

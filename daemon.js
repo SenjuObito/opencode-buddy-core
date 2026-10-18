@@ -13,10 +13,17 @@
  *
  * Protocol (stdout, one JSON per line):
  *   {"type":"daemon","event":"ready","pid":12345}           // daemon lifecycle
- *   {"id":"1","line":"[STREAM_START]"}                      // command output
- *   {"id":"1","line":"[CONTENT_DELTA] \"Hello\""}           // streaming delta
- *   {"id":"1","done":true,"success":true}                   // command complete
+ *   {"id":"1","session":"ses_x","turn":null,"seq":null,"line":"[STREAM_START]"}
+ *   {"id":"1","session":"ses_x","turn":1042,"seq":1047,"line":"[CONTENT_DELTA] \"Hi\""}
+ *   {"id":"1","session":"ses_x","done":true,"success":true}   // command complete
  *   {"id":"2","type":"heartbeat","ts":1234567890}           // heartbeat response
+ *
+ * Every data line carries the identity envelope `{id, session, turn, seq}`:
+ *   id      — request/response pairing (control plane only; null otherwise)
+ *   session — the session the content belongs to (data ownership). null ⇒ the
+ *             line belongs to no session and MUST NOT be attributed to one.
+ *   turn    — turnId (the session's `durable.seq` at turn start); null outside a turn
+ *   seq     — server-provided monotonic sequence within the session
  *
  * Key advantages over per-request spawning:
  * - opencode serve + SSE subscription reused across requests (no cold start)
@@ -28,7 +35,9 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { createInterface } from 'readline';
 import { handleOpenCodeCommand } from './channels/opencode-channel.js';
-import { requestContext } from './request-context.js';
+import { requestContext, currentContext } from './request-context.js';
+import { isTurnCommand, requestContextRecord } from './utils/request-identity.js';
+import { buildEnvelope, forEachProtocolLine, hasIdentity } from './utils/ndjson-envelope.js';
 import {
   sendMessagePersistent,
   sendShellPersistent,
@@ -38,6 +47,7 @@ import {
   getContextUsagePersistent,
 } from './services/opencode/opencode-daemon-service.js';
 import * as serveManager from './services/opencode/opencode-serve-manager.js';
+import * as engineRegistry from './services/opencode/engine-registry.js';
 import { listModels as listOpenCodeModels } from './services/opencode/models-service.js';
 import { isWebviewControlledEnvVar, isDangerousEnvVar } from './config/api-config.js';
 
@@ -57,23 +67,33 @@ const DAEMON_VERSION = '1.0.0';
 // State
 // =============================================================================
 
-// The id of the in-flight opencode.send / opencode.shell turn.  SSE events
-// emitted by the long-lived background subscription run outside any request
-// context, so they fall back to this id (preserving the old global behavior).
-let backgroundStreamRequestId = null;
 let isDaemonMode = true;
 let sdkPreloaded = false;
 
+/**
+ * The request whose terminal ack (`done`) has already been written by the
+ * process.exit interceptor (or a fatal-error handler), so processRequest()'s
+ * catch block must not emit a second one.
+ *
+ * Purely a de-duplication slot for the control plane. It is NOT session
+ * identity and must never be used to attribute output — identity lives
+ * exclusively in the AsyncLocalStorage record read by `currentContext()`.
+ */
+let ackAlreadySentFor = null;
+
+/** Request id of the active request, if any (control-plane replies only). */
 function currentRequestId() {
-  return requestContext.getStore()?.id ?? backgroundStreamRequestId ?? null;
+  return currentContext().id;
 }
 
-function isTurnCommand(method) {
-  if (typeof method !== 'string') return false;
-  const dotIndex = method.indexOf('.');
-  const command = dotIndex >= 0 ? method.substring(dotIndex + 1) : method;
-  return command === 'send' || command === 'shell';
-}
+/**
+ * @see utils/request-identity.js — `isTurnCommand` / `requestContextRecord`
+ * live there and are unit-tested. Only turn commands take a session identity
+ * from their params; a shared query's output is its own response payload and
+ * must stay `id`-attributable, otherwise the host routes it to the session's
+ * sink and the caller's collector receives nothing (history restore used to
+ * report "0 messages, success" and render a blank tab with no error).
+ */
 
 // =============================================================================
 // Output Interception
@@ -202,26 +222,28 @@ function sendDaemonEvent(event, data = {}) {
 }
 
 /**
- * Override process.stdout.write to tag output with request ID.
+ * Override process.stdout.write to stamp output with the identity envelope.
+ *
+ * This is the **only** place in the whole system where session identity is
+ * produced (see docs/multi-session-identity-refactoring.md §2.1). Every marker
+ * emitter — `emitJsonStringMarker`, `emitSessionId`, `beginStream`, and
+ * anything routed through `console.log` — funnels through here, so stamping
+ * once covers all of them without touching a single call site.
  */
 process.stdout.write = function (chunk, encoding, callback) {
   // Convert Buffer to string if needed
   const text = typeof chunk === 'string' ? chunk : chunk.toString(encoding || 'utf8');
+  const ctx = currentContext();
 
-  const requestId = currentRequestId();
-  if (requestId) {
-    // Tag output with request ID for demuxing on host side
-    const lines = text.split('\n');
-    for (const line of lines) {
-      if (line.length > 0) {
-        writeRawLine({ id: requestId, line });
-      }
-    }
+  if (hasIdentity(ctx)) {
+    forEachProtocolLine(text, (line) => {
+      if (line.length > 0) writeRawLine(buildEnvelope(ctx, line));
+    });
     if (typeof callback === 'function') callback();
     return true;
   }
 
-  // No active request — check if this is already JSON (daemon event).
+  // No identity at all — check if this is already JSON (daemon event).
   // SAFETY: writeRawLine() always produces lines starting with '{' (JSON.stringify
   // of an object), so they pass through to _originalStdoutWrite without recursion.
   const trimmed = text.trim();
@@ -229,15 +251,14 @@ process.stdout.write = function (chunk, encoding, callback) {
     return _originalStdoutWrite(chunk, encoding, callback);
   }
 
-  // Non-JSON output without a request context (e.g., SDK debug logs during preload)
+  // Non-JSON output without any identity (e.g., SDK debug logs during preload)
   // Wrap as a daemon log event so the host's NDJSON parser can handle it
   if (trimmed.length > 0) {
-    const lines = text.split('\n');
-    for (const line of lines) {
+    forEachProtocolLine(text, (line) => {
       if (line.trim().length > 0) {
         writeRawLine({ type: 'daemon', event: 'log', message: line });
       }
-    }
+    });
   }
   if (typeof callback === 'function') callback();
   return true;
@@ -275,9 +296,9 @@ console.error = function (...args) {
   if (DAEMON_LOG_LEVEL === 'error' && text.startsWith('[DEBUG]')) {
     return;
   }
-  const requestId = currentRequestId();
-  if (requestId) {
-    writeRawLine({ id: requestId, stderr: text });
+  const ctx = currentContext();
+  if (ctx.id !== null) {
+    writeRawLine({ id: ctx.id, session: ctx.sessionId, stderr: text });
   } else {
     _originalStderrWrite(text + '\n', 'utf8');
   }
@@ -292,15 +313,22 @@ process.exit = function (code) {
   if (isDaemonMode) {
     // Capture the current request ID before clearing it, so the catch block
     // in processRequest() won't try to send a duplicate done signal.
-    const capturedId = currentRequestId();
-    backgroundStreamRequestId = null;
+    const capturedCtx = currentContext();
+    const capturedId = capturedCtx.id;
+    if (capturedId) ackAlreadySentFor = capturedId;
 
     if (capturedId) {
       if (code === 0) {
-        writeRawLine({ id: capturedId, done: true, success: true });
+        writeRawLine({
+          id: capturedId,
+          session: capturedCtx.sessionId,
+          done: true,
+          success: true,
+        });
       } else {
         writeRawLine({
           id: capturedId,
+          session: capturedCtx.sessionId,
           done: true,
           success: false,
           error: `process.exit(${code}) intercepted by daemon`,
@@ -308,7 +336,7 @@ process.exit = function (code) {
       }
     }
     // Throw to unwind the current call stack instead of actually exiting.
-    // processRequest's catch block checks activeRequestId === null and
+    // processRequest's catch block checks ackAlreadySentFor === id and
     // will skip sending a duplicate done signal.
     throw new Error(`[daemon] process.exit(${code}) intercepted`);
   }
@@ -402,6 +430,9 @@ async function processRequest(request) {
       serverUrl: serveManager.getServerUrl(),
       nodeVersion: process.version,
       memoryUsage: process.memoryUsage(),
+      // Engine self-check: the single place to look when "which v1/v2 am I
+      // talking to, and why" is the question (previously absent entirely).
+      engine: engineRegistry.getStatus(),
     });
     return;
   }
@@ -426,13 +457,12 @@ async function processRequest(request) {
     return;
   }
 
-  // Turn commands (send / shell) own the SSE stream; mark them as the
-  // background stream owner so events emitted outside any request context
-  // (the long-lived SSE subscription) are still attributed to the active turn.
+  // Turn commands (send / shell) drive the SSE stream for their session. Their
+  // session identity is supplied by the caller (`params.sessionId`) or, for a
+  // brand-new session, discovered and bound by the turn itself
+  // (`bindSession()` in opencode-daemon-service.js). It is never inferred here:
+  // there is no "the current session" fallback any more.
   const turnCommand = isTurnCommand(method);
-  if (turnCommand) {
-    backgroundStreamRequestId = id;
-  }
 
   // Save original env values for restoration after request completes.
   // Env vars are only applied to turn commands: shared read-only commands run
@@ -479,6 +509,17 @@ async function processRequest(request) {
     const stdinData = { ...params };
     delete stdinData.env; // env is handled separately
 
+    // Gate every opencode request on a *verified* engine mode.
+    //
+    // Placing this at the request boundary (rather than inside each of the 24
+    // `engineRegistry.isV2()` branches in opencode-sdk-client) is what makes the
+    // remaining synchronous reads safe: by the time a branch is evaluated,
+    // `ensure()` has either locked v1/v2 from a capability probe or thrown
+    // EngineUnresolvedError — so no request is ever sent down a guessed route.
+    if (provider === 'opencode') {
+      await engineRegistry.ensure();
+    }
+
     switch (`${provider}.${command}`) {
       case 'opencode.send':
         await sendMessagePersistent(stdinData);
@@ -505,12 +546,13 @@ async function processRequest(request) {
         }
     }
 
-    writeRawLine({ id, done: true, success: true });
+    writeRawLine({ id, session: currentContext().sessionId, done: true, success: true });
   } catch (error) {
     // Only send done if not already sent (e.g., by process.exit interceptor)
-    if (backgroundStreamRequestId === id || currentRequestId() === id) {
+    if (ackAlreadySentFor !== id) {
       writeRawLine({
         id,
+        session: currentContext().sessionId,
         done: true,
         success: false,
         error: error.message || String(error),
@@ -518,9 +560,7 @@ async function processRequest(request) {
       });
     }
   } finally {
-    if (backgroundStreamRequestId === id) {
-      backgroundStreamRequestId = null;
-    }
+    if (ackAlreadySentFor === id) ackAlreadySentFor = null;
     // Restore original environment variables to prevent cross-request pollution
     for (const [key, originalValue] of Object.entries(savedEnv)) {
       if (originalValue === undefined) {
@@ -547,11 +587,12 @@ async function runDaemonMain() {
     if (requestId) {
       writeRawLine({
         id: requestId,
+        session: currentContext().sessionId,
         done: true,
         success: false,
         error: `Uncaught exception: ${error.message}`,
       });
-      backgroundStreamRequestId = null;
+      ackAlreadySentFor = requestId;
     }
   });
 
@@ -564,11 +605,12 @@ async function runDaemonMain() {
     if (requestId) {
       writeRawLine({
         id: requestId,
+        session: currentContext().sessionId,
         done: true,
         success: false,
         error: `Unhandled rejection: ${String(reason)}`,
       });
-      backgroundStreamRequestId = null;
+      ackAlreadySentFor = requestId;
     }
   });
 
@@ -580,10 +622,42 @@ async function runDaemonMain() {
     platform: process.platform,
   });
 
-  // Deterministically detect and lock engine mode (v1 or v2) at boot time
-  const engine = serveManager.initEngineMode();
+  // Engine mode is deliberately NOT decided here any more.
+  //
+  // It used to be: `initEngineMode()` at boot, which resolved the CLI with a
+  // `--version` probe that always failed on Windows (`.cmd` executed without a
+  // shell ⇒ EINVAL) and then *locked that failure in as v1* for the rest of the
+  // process. Everything downstream trusted the boolean, so a v2 server was
+  // driven through v1 routes ("Request is not supported by this version").
+  //
+  // Now: (1) resolve the CLI only — no spawn — so a missing/invalid CLI surfaces
+  // immediately instead of on the first user message; (2) report the status to
+  // the host; (3) let the first request pass through `engineRegistry.ensure()`,
+  // which probes the running server's capabilities and only then locks a mode.
+  engineRegistry.subscribe((status) => {
+    sendDaemonEvent('engine_status', {
+      state: status.state,
+      locked: status.locked,
+      cliPath: status.cli.path,
+      cliVersion: status.cli.version,
+      cliSource: status.cli.source,
+      cliVerified: status.cli.verified,
+      probePath: status.evidence ? status.evidence.probePath : null,
+      httpStatus: status.evidence ? status.evidence.status : null,
+      apiVersion: status.evidence ? status.evidence.apiVersion : null,
+      reasonKind: status.reason.kind,
+      reasonMessage: status.reason.message,
+      blocking: status.reason.blocking,
+      ts: status.updatedAt,
+    });
+  });
+
+  const bootStatus = engineRegistry.resolveOnly();
   _originalStderrWrite(
-    `[daemon] Engine mode determined at boot: isV2=${engine.isV2} (version=${engine.version || 'none'}, binary=${engine.binary || 'none'})\n`,
+    `[daemon] Engine mode pending; CLI=${bootStatus.cli.path || 'none'}`
+    + ` (source=${bootStatus.cli.source || 'n/a'}, version=${bootStatus.cli.version || 'unknown'})`
+    + ` state=${bootStatus.state}`
+    + `${bootStatus.reason.kind !== 'none' ? ` reason=${bootStatus.reason.kind}` : ''}\n`,
     'utf8'
   );
 
@@ -593,8 +667,10 @@ async function runDaemonMain() {
   // Signal ready
   sendDaemonEvent('ready', {
     pid: process.pid,
-    engineMode: engine.isV2 ? 'v2' : 'v1',
-    cliVersion: engine.version,
+    // Honest value: 'pending' until a capability probe has actually locked a
+    // mode. The previous code always claimed 'v1' or 'v2' here.
+    engineMode: bootStatus.locked ? bootStatus.state : 'pending',
+    cliVersion: bootStatus.cli.version,
     sdkPreloaded,
   });
 
@@ -660,7 +736,7 @@ async function runDaemonMain() {
       const stdinData = { ...request.params };
       delete stdinData.env;
       console.log(`[daemon][bypass] ${request.method} id=${request.id} params=${JSON.stringify(stdinData)}`);
-      requestContext.run({ id: request.id }, () => {
+      requestContext.run(requestContextRecord(request), () => {
         handleOpenCodeCommand(command, [], stdinData)
           .then(() => {
             console.log(`[daemon][bypass] ${request.method} id=${request.id} SUCCESS`);
@@ -682,7 +758,7 @@ async function runDaemonMain() {
         : `__turn_${request.id}`;
       const prevQueue = sessionTurnQueues.get(queueKey) || Promise.resolve();
       const nextQueue = prevQueue
-        .then(() => requestContext.run({ id: request.id }, () => processRequest(request)))
+        .then(() => requestContext.run(requestContextRecord(request), () => processRequest(request)))
         .catch((e) => {
           _originalStderrWrite(
             `[daemon] Turn queue error for session=${queueKey}: ${e.message}\n`,
@@ -698,7 +774,7 @@ async function runDaemonMain() {
       return;
     }
 
-    requestContext.run({ id: request.id }, () => processRequest(request)).catch((e) => {
+    requestContext.run(requestContextRecord(request), () => processRequest(request)).catch((e) => {
       _originalStderrWrite(
         `[daemon] Shared request error: ${e.message}\n`,
         'utf8'

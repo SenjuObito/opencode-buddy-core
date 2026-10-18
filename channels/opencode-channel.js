@@ -5,6 +5,7 @@
 import { sendMessage as openCodeSendMessage } from '../services/opencode/message-service.js';
 import { listModels as openCodeListModels, ensureServerReady } from '../services/opencode/models-service.js';
 import { getSessionDirectory } from '../services/opencode/opencode-daemon-service.js';
+import * as engineRegistry from '../services/opencode/engine-registry.js';
 import {
   replyPermission as openCodeReplyPermission,
   replyQuestion as openCodeReplyQuestion,
@@ -52,6 +53,19 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
   ) {
     stdinData.directory = stdinData.cwd;
   }
+
+  // Gate the whole one-shot channel entry point on a verified engine mode.
+  //
+  // This entry is used by the host for history / session / file / MCP commands,
+  // and it runs in a *fresh* process that did not spawn `opencode serve` — so it
+  // cannot rely on any in-memory mode decided by daemon.js. Previously the
+  // per-command `isV2()` read lazily triggered a boot-time-equivalent detection
+  // here, which fails on Windows and silently fell back to v1 routes — the
+  // "history will not load" failure. `ensure()` probes the already-running
+  // server's capabilities instead (one HTTP call in the common case), and is
+  // idempotent/O(1) once locked.
+  await engineRegistry.ensure();
+
   switch (command) {
     case 'send': {
       if (stdinData && stdinData.message !== undefined) {
@@ -223,7 +237,8 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
     }
 
     case 'replyQuestion': {
-      const { sessionId, questionID, answers, directory: explicitDirectory } = stdinData || {};
+      const { sessionId, answers, directory: explicitDirectory } = stdinData || {};
+      const questionID = stdinData?.questionID || stdinData?.requestId || stdinData?.id;
       const directory = getSessionDirectory(sessionId) || explicitDirectory;
       console.log(`[opencode-channel] replyQuestion sessionId=${sessionId} questionID=${questionID} directory=${directory || '-'} answers=${JSON.stringify(answers)}`);
       await openCodeReplyQuestion(sessionId, questionID, Array.isArray(answers) ? answers : [], directory);
@@ -232,7 +247,8 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
     }
 
     case 'rejectQuestion': {
-      const { sessionId, questionID, directory: explicitDirectory } = stdinData || {};
+      const { sessionId, directory: explicitDirectory } = stdinData || {};
+      const questionID = stdinData?.questionID || stdinData?.requestId || stdinData?.id;
       const directory = getSessionDirectory(sessionId) || explicitDirectory;
       await openCodeRejectQuestion(sessionId, questionID, directory);
       break;
@@ -273,15 +289,21 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
 
     case 'revert': {
       const { sessionId, messageID, directory } = stdinData || {};
-      const session = await openCodeRevertSession(sessionId, messageID, directory || undefined);
-      console.log(JSON.stringify({ success: true, provider: 'opencode', session: session ?? null }));
+      const result = await openCodeRevertSession(sessionId, messageID, directory || undefined);
+      const revertInfo = result?.revert ?? (result?.messageID ? result : null);
+      console.log(JSON.stringify({
+        success: true,
+        provider: 'opencode',
+        session: result?.revert ? result : (revertInfo ? { revert: revertInfo } : result),
+        revert: revertInfo,
+      }));
       break;
     }
 
     case 'unrevert': {
       const { sessionId, directory } = stdinData || {};
-      const session = await openCodeUnrevertSession(sessionId, directory || undefined);
-      console.log(JSON.stringify({ success: true, provider: 'opencode', session: session ?? null }));
+      const result = await openCodeUnrevertSession(sessionId, directory || undefined);
+      console.log(JSON.stringify({ success: true, provider: 'opencode', session: result ?? null, revert: null }));
       break;
     }
 

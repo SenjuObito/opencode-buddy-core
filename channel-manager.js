@@ -144,6 +144,18 @@ const providerHandlers = {
     // before the stdout buffer is fully flushed, which can truncate large JSON
     // output. Instead, set process.exitCode and let the process exit naturally.
     process.exitCode = 0;
+
+    // Natural exit is preferred, but it is not guaranteed: keep-alive sockets
+    // from the `fetch` pools (engine probe / SDK client) and a grandchild
+    // opencode.exe holding inherited pipes can keep the event loop referenced
+    // indefinitely. The host reads this process's stdout and then waits for it,
+    // so hanging here would stall the UI. Give the flush a moment, then exit
+    // deterministically. `unref()` means this never *causes* a delay — it only
+    // fires when something else would have kept us alive anyway.
+    const forceExit = setTimeout(() => {
+      process.exit(process.exitCode || 0);
+    }, 1500);
+    forceExit.unref();
   } catch (error) {
     writeJsonAndExit({
       success: false,

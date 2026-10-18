@@ -38,6 +38,7 @@ import {
   emitToolResultMessage,
   emitToolUseMessage,
   emitSendError,
+  emitTurnEnd,
   emitUsage,
 } from '../../utils/marker-protocol.js';
 import {
@@ -47,13 +48,15 @@ import {
   formatInlinedAttachments,
 } from '../../utils/cli-image-input.js';
 import * as serveManager from './opencode-serve-manager.js';
+import * as engineRegistry from './engine-registry.js';
 import * as sdk from './opencode-sdk-client.js';
 import { logInfo, logWarn, logError, logDebug } from '../../utils/logger.js';
 import {
   normalizePermissionRequest,
   normalizeQuestionRequest,
 } from './event-normalize.js';
-import { requestContext } from '../../request-context.js';
+import { resolvePendingCompaction } from './compaction-tracker.js';
+import { requestContext, bindSession, runWithIdentity } from '../../request-context.js';
 
 // =============================================================================
 // Module state
@@ -84,19 +87,14 @@ const _sseSubPromises = new Map();
 const _activeTurns = new Map();
 /** @type {Map<string, { directory?: string }>} sessionID → session state */
 const _sessions = new Map();
-/**
- * Sessions whose turn was abandoned locally by the 180s timeout while opencode
- * was still working on it. Their late `session.error` has no active turn to
- * settle and MUST NOT be mistaken for a compaction failure — it is the real
- * reason the turn died, arriving after the UI already gave up. Keyed by
- * sessionID, consumed (and deleted) by the first matching late error, and
- * bounded by a TTL so a session that never reports back cannot leak.
- * @type {Map<string, { at: number }>}
- */
-const _timedOutTurns = new Map();
-const TIMED_OUT_TURN_TTL_MS = 30 * 60 * 1000;
-/** Local fallback bound for a single turn, from request to settle. */
-const TURN_TIMEOUT_MS = 180_000;
+
+// ── Test seams ──────────────────────────────────────────────────────────────
+// `_handleEvent`, `_activeTurns`, `_createTurn`, `_settleTurn` and
+// `_emitTurnEndOnce` are exported (underscore-prefixed, like `_handleToolPart`)
+// purely so the session-identity and turn-terminal contracts can be asserted
+// without a live server: identity injection and turn settling are exactly where
+// the multi-session defects lived. Not part of the public daemon API.
+export { _handleEvent, _activeTurns, _createTurn, _settleTurn, _emitTurnEndOnce, trackSession as _trackSession, _resolveSession };
 
 /** session 目录注册表上限：超限按插入序丢最旧（近似 LRU）。条目极小，但
  * 常驻 daemon 生命周期内无界增长没有任何收益。 */
@@ -119,10 +117,13 @@ function trackSession(sessionId, info) {
 serveManager.onServeExit(({ code, signal, uptime, stderrTail }) => {
   const exitMsg = `OpenCode serve 进程异常退出 (退出码: ${code ?? signal ?? 'unknown'}, uptime: ${uptime}ms)`;
   console.error(`[OpenCodeDaemon:watchdog] Serve process died, settling ${_activeTurns.size} active turn(s)...`);
+  // Drop the locked engine mode: the next request re-runs resolve → probe →
+  // lock against the replacement process (INV-2: never flip v1 ↔ v2 directly).
+  engineRegistry.invalidate('serve-exit');
   for (const [sessionId, turn] of _activeTurns) {
     if (turn.settled) continue;
     console.error(`[OpenCodeDaemon:watchdog] Aborting active turn for sessionId=${sessionId} due to serve process exit`);
-    _settleTurn(turn, { success: false, error: { message: exitMsg } });
+    _settleTurn(turn, { success: false, error: { message: exitMsg }, reason: 'disconnected' });
   }
   // 终止所有 SSE 订阅
   for (const sub of _sseSubs.values()) {
@@ -297,8 +298,14 @@ async function _ensureReady(directory) {
   // Reset auto-restart budget whenever user actively initiates a request
   serveManager.resetRestartAttempts();
 
+  // Engine first: resolve CLI → make a server reachable → capability-probe →
+  // lock the mode. "Process ready" and "engine ready" are two different things;
+  // conflating them is what let requests go out on a guessed v1 route.
+  await engineRegistry.ensure();
+
   // Path ①: re-launch serve on send if it crashed between requests.
   // `_serveStarted` stays true after a crash, so also check the live process.
+  // (No-op when ensure() just started or reused a server.)
   if (!_serveStarted || !serveManager.isRunning()) {
     await serveManager.start(DEFAULT_PORT);
     _serveStarted = true;
@@ -312,10 +319,11 @@ async function _ensureReady(directory) {
       const stream = await sdk.subscribeEvents(directory, controller.signal);
       _sseSubs.set(directory, { stream, controller });
       // Kick off the per-directory event loop detached from the request context
-      // that created it.  The loop is long-lived; if it inherited a request id,
-      // all subsequent SSE events would be mis-tagged to that stale id instead
-      // of falling back to the active turn's id.
-      requestContext.run({ id: null }, () => {
+      // that created it. The loop is long-lived; if it inherited a request id,
+      // all subsequent SSE events would be mis-tagged to that stale id. It runs
+      // with an empty identity record — `_handleEvent()` installs the correct
+      // one per event, including for events that have no active turn.
+      requestContext.run({ id: null, sessionId: null, turnId: null, seq: null }, () => {
         _runSseLoop(stream, directory).catch((err) => {
           logDebug('SSE loop exited:', err?.message || err);
         });
@@ -372,7 +380,7 @@ async function _runSseLoop(stream, directory) {
     for (const [sessionID, turn] of _activeTurns) {
       if (turn.settled) continue;
       logDebug('failing active turn due to SSE death:', sessionID);
-      _settleTurn(turn, { success: false, error: { message: 'Event stream disconnected' } });
+      _settleTurn(turn, { success: false, error: { message: 'Event stream disconnected' }, reason: 'disconnected' });
     }
   }
 }
@@ -386,6 +394,22 @@ async function _runSseLoop(stream, directory) {
  * markers. Uses `properties` (the runtime shape, verified against opencode
  * 1.18.x) with a `data` fallback for older/newer servers.
  */
+/**
+ * Server-provided monotonic sequence within a session (`durable.seq`).
+ *
+ * The aggregate of `durable` is the session (`aggregateID === sessionID`), so
+ * this is a *session*-level counter, not a turn-level one. It is used for two
+ * things: ordering events within a session, and defining `turnId` (see
+ * `_handleEvent`). Servers that don't send it yield `null`, and consumers
+ * degrade to arrival order.
+ */
+function _resolveSeq(evt, props) {
+  const raw = props?.durable?.seq ?? evt?.durable?.seq ?? null;
+  if (raw === null || raw === undefined || raw === '') return null;
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
 function _handleEvent(evt) {
   const props = (evt && evt.properties && typeof evt.properties === 'object')
     ? evt.properties
@@ -394,49 +418,130 @@ function _handleEvent(evt) {
   const sessionID = props?.sessionID
     || props?.sessionId
     || props?.session_id
+    || props?.info?.id
+    || props?.info?.sessionID
+    || props?.info?.sessionId
     || evt?.sessionID
     || evt?.sessionId
+    || evt?.info?.id
     || evt?.properties?.sessionID
+    || evt?.properties?.info?.id
     || evt?.data?.sessionID;
+  const seq = _resolveSeq(evt, props);
   const turn = sessionID ? _activeTurns.get(sessionID) : null;
   if (turn) {
     turn.lastActivityAt = Date.now();
+    // turnId is the `durable.seq` of the turn's FIRST event. Because `seq` is
+    // monotonic per session, this makes turnIds strictly increasing and unique
+    // across turns without inventing a counter (which would break on restart).
+    if (turn.turnId == null && seq != null) turn.turnId = seq;
   }
 
-  const runWithContext = (fn) => {
-    if (turn && turn.requestId) {
-      return requestContext.run({ id: turn.requestId }, fn);
-    }
-    return fn();
-  };
+  // Attach identity unconditionally. Even an event with no active turn — a
+  // tracked session's `session.created`, a `message.removed`, a late error —
+  // still knows which session it belongs to, and emitting it with no identity
+  // is exactly what let it leak into an unrelated session. `fn()` bare is never
+  // correct here.
+  requestContext.run(
+    {
+      id: turn?.requestId ?? null,
+      sessionId: sessionID ?? null,
+      turnId: turn?.turnId ?? null,
+      seq,
+    },
+    () => _dispatchInnerEvent(type, props, sessionID, turn),
+  );
+}
 
-  runWithContext(() => {
-    _dispatchInnerEvent(type, props, sessionID, turn);
+/**
+ * Emit `[QUESTION_REQUEST]` for a question tool call, derived from the tool
+ * event rather than from the `question.asked` SSE event.
+ *
+ * <p>Why derive it here: on opencode v2 the `question.asked` event's properties
+ * carry neither `id` nor `sessionID` (verified against a live v2.0.27 server —
+ * the daemon's own log prints an empty requestId and the line falls through to
+ * raw stderr with no identity), so the marker it would emit has no envelope
+ * identity and the host demotes it to a plain log line. The tool event, by
+ * contrast, *does* resolve a session (that is how `emitToolUseMessage` reaches
+ * the right tab) and carries the full `input.questions` payload.</p>
+ *
+ * <p>Engine scope: `session.tool.input` / `session.tool.called` are v2 event
+ * names. v1 reports the same tool call through `message.part.updated` →
+ * `_handleToolPart`, which is deliberately left alone — v1's `question.asked`
+ * event does carry identity and already works. The two paths therefore never
+ * both fire for one engine, and `turn.questionPrompted` makes that a guarantee
+ * rather than an assumption.</p>
+ *
+ * @param {object} turn        active turn record (owns the de-dup set)
+ * @param {string} sessionID   session the event belongs to
+ * @param {string} callID      tool call id (also the webview's lookup key)
+ * @param {string} name        resolved tool name
+ * @param {object} input       tool input
+ */
+function maybeEmitQuestionPrompt(turn, sessionID, callID, name, input) {
+  if (name !== 'question') return;
+  if (!sessionID) return;
+  if (turn.questionPrompted?.has(callID)) return;
+
+  const questions = Array.isArray(input?.questions) ? input.questions : [];
+  if (questions.length === 0) return;
+
+  turn.questionPrompted.add(callID);
+
+  // Reuse the canonical normalizer so the payload shape matches what the
+  // `question.asked` path produces — the host parser and the webview card read
+  // exactly one shape.
+  const request = normalizeQuestionRequest({
+    id: callID,
+    sessionID,
+    questions,
+    tool: callID,
   });
+  logDebug('question prompt derived from tool event:', callID, 'session:', sessionID,
+    'questions:', request.questions.length);
+  emitJsonStringMarker('[QUESTION_REQUEST]', request);
+}
+
+/**
+ * One-shot diagnostic for events this build does not handle.
+ *
+ * A silent `default: break` is how a whole class of "the dialog never shows
+ * up" bugs stays invisible: the server is emitting an event whose name or
+ * shape this version does not know, and nothing anywhere says so. Logging each
+ * unknown type once per process turns that into a one-line answer in
+ * `~/.opencode-idea-gui/opencode-plugin.log`.
+ */
+const _unloggedEventTypes = new Set();
+
+function noteUnhandledEventType(type) {
+  if (!type || _unloggedEventTypes.has(type)) return;
+  _unloggedEventTypes.add(type);
+  logDebug('unhandled event type (no case in this build):', type);
 }
 
 function _dispatchInnerEvent(type, props, sessionID, turn) {
   switch (type) {
     case 'session.created':
     case 'session.updated':
+    case 'session.renamed':
     case 'session.initialize': {
       // Track the session's directory. The [SESSION_ID] marker is emitted by the
-      // send/preconnect path itself (authoritative), so we only record state here
-      // — and only for sessions we created, so a sibling `opencode` in the same
-      // directory can't inject stray session events into our stream.
-      const id = sessionID || props?.info?.id;
-      if (id && _sessions.has(id)) {
+      // send/preconnect path itself (authoritative), so we only record state here.
+      const id = sessionID || props?.info?.id || props?.id || props?.sessionId;
+      if (id) {
+        if (!_sessions.has(id)) {
+          trackSession(id, {
+            directory: props?.info?.directory || props?.directory,
+            revert: props?.info?.revert || props?.revert,
+          });
+        } else {
+          const revert = props?.info?.revert;
+          trackSession(id, {
+            directory: props?.info?.directory || _sessions.get(id)?.directory,
+            revert,
+          });
+        }
         const revert = props?.info?.revert;
-        trackSession(id, {
-          directory: props?.info?.directory || _sessions.get(id)?.directory,
-          revert,
-        });
-        // Emit revert state update to frontend.
-        // Payload is passed as an OBJECT on purpose: emitJsonStringMarker already
-        // JSON-stringifies it once. Pre-stringifying here double-encodes the
-        // payload, and the host parser (which expects a bare JSON object) drops
-        // the event silently — that is why the revert boundary id never reached
-        // the webview.
         if (turn) {
           emitJsonStringMarker('[REVERT_STATE]', {
             hasRevert: !!revert,
@@ -444,10 +549,11 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
           });
         }
         // Emit session title update to frontend
-        if (props?.info?.title && typeof props.info.title === 'string') {
-          const title = props.info.title.trim();
+        const rawTitle = props?.info?.title || props?.title || props?.name || props?.info?.name;
+        if (rawTitle && typeof rawTitle === 'string') {
+          const title = rawTitle.trim();
           if (title) {
-            emitJsonStringMarker('[SESSION_TITLE]', JSON.stringify({ sessionId: id, title }));
+            emitJsonStringMarker('[SESSION_TITLE]', { sessionId: id, title });
           }
         }
       }
@@ -568,6 +674,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
             turn.toolUseDone.add(callID);
             emitToolUseMessage({ id: callID, name, input });
           }
+          maybeEmitQuestionPrompt(turn, sessionID, callID, name, input);
         }
       }
       break;
@@ -607,7 +714,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
         }
       }
       if (turn) {
-        _settleTurn(turn, { success: exitCode === 0 });
+        _settleTurn(turn, { success: exitCode === 0, reason: exitCode === 0 ? 'idle' : 'error' });
       }
       break;
     }
@@ -650,47 +757,51 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     case 'session.execution.succeeded':
       if (turn) _settleTurn(turn, { success: true });
       break;
-    case 'session.compacted': {
+    case 'session.compacted':
+    case 'session.compaction.ended':
+    case 'session.next.compaction.ended':
+    case 'session.next.compaction.ended.1': {
       // 压缩完成信号。压缩不是 turn（无 active turn / done 信号可达 UI），
       // 必须经 marker 越权上报，宿主才能把结果送到对话列表。
-      const compactSessionID = sessionID || props?.info?.id || '';
-      logDebug('session.compacted:', compactSessionID);
+      const compactSessionID = sessionID || props?.info?.id || props?.data?.sessionID || props?.sessionID || '';
+      logDebug('session.compacted / compaction.ended:', compactSessionID);
+      resolvePendingCompaction(compactSessionID, true);
       emitJsonStringMarker('[SESSION_COMPACT_RESULT]', JSON.stringify({
         sessionID: compactSessionID,
         success: true,
       }));
       break;
     }
+    case 'session.compaction.started':
+    case 'session.next.compaction.started':
+    case 'session.next.compaction.started.1':
+    case 'session.compaction.delta':
+    case 'session.next.compaction.delta': {
+      const compactSessionID = sessionID || props?.data?.sessionID || props?.sessionID || '';
+      logDebug(`${type}:`, compactSessionID);
+      break;
+    }
+    case 'session.compaction.failed':
+    case 'session.next.compaction.failed':
     case 'session.error':
     case 'session.execution.failed': {
-      const err = props?.error || { message: type };
-      if (turn) {
+      const isCompactionFailed = type.includes('compaction');
+      const err = props?.error || props?.data?.error || { message: type };
+      if (turn && !isCompactionFailed) {
         _settleTurn(turn, { success: false, error: err });
       }
       // 无 active turn 时的错误（如压缩失败）没有其他上报通道，
       // 同样走 marker，宿主按 sessionID + pending 状态过滤。有 active turn
       // 时错误属于当前对话 turn，不能误报为压缩失败。
-      if (!turn) {
-        const timedOut = sessionID ? _timedOutTurns.get(sessionID) : null;
-        if (timedOut && Date.now() - timedOut.at < TIMED_OUT_TURN_TTL_MS) {
-          // 本地 180s 超时已经替这个会话报过一次失败了，这是服务端迟到的真实
-          // 原因。它绝不能走 [SESSION_COMPACT_RESULT]——那条通道宿主只打一行
-          // log 就丢了，等于把"额度耗尽"这类唯一有解释力的信息二次掩埋。
-          _timedOutTurns.delete(sessionID);
-          logDebug(`${type} after local timeout:`, sessionID, JSON.stringify(err).substring(0, 200));
-          emitJsonStringMarker('[TURN_ERROR]', {
-            sessionID: sessionID || '',
-            message: err?.message || String(err),
-            source: 'late-after-timeout',
-          });
-        } else {
-          logDebug(`${type} (no turn):`, sessionID || '', JSON.stringify(err).substring(0, 200));
-          emitJsonStringMarker('[SESSION_COMPACT_RESULT]', JSON.stringify({
-            sessionID: sessionID || props?.info?.id || '',
-            success: false,
-            error: err?.message || String(err),
-          }));
-        }
+      if (!turn || isCompactionFailed) {
+        const compactSessionID = sessionID || props?.info?.id || props?.data?.sessionID || props?.sessionID || '';
+        logDebug(`${type} (compaction / no turn):`, compactSessionID, JSON.stringify(err).substring(0, 200));
+        resolvePendingCompaction(compactSessionID, false, err?.message || String(err));
+        emitJsonStringMarker('[SESSION_COMPACT_RESULT]', JSON.stringify({
+          sessionID: compactSessionID,
+          success: false,
+          error: err?.message || String(err),
+        }));
       }
       break;
     }
@@ -736,7 +847,11 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       const requestId = props?.requestID ?? props?.formID ?? props?.id ?? '';
       logDebug('question/form closed:', type, requestId);
       if (requestId) {
-        emitJsonStringMarker('[QUESTION_CLOSED]', { requestId });
+        // `sessionID` is in-band redundancy: the transport envelope already
+        // carries it, but a close event is a *falling edge* (the one that used
+        // to arrive with no identity at all), so the host cross-checks the two
+        // and prefers the envelope when they disagree.
+        emitJsonStringMarker('[QUESTION_CLOSED]', { requestId, sessionID: sessionID || '' });
       }
       break;
     }
@@ -746,7 +861,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       const permissionId = props?.permissionID ?? props?.requestID ?? props?.id ?? '';
       logDebug('permission closed:', type, permissionId);
       if (permissionId) {
-        emitJsonStringMarker('[PERMISSION_CLOSED]', { permissionId });
+        emitJsonStringMarker('[PERMISSION_CLOSED]', { permissionId, sessionID: sessionID || '' });
       }
       break;
     }
@@ -759,6 +874,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       break;
     }
     default:
+      noteUnhandledEventType(type);
       break;
   }
 }
@@ -867,11 +983,30 @@ function _reconcileToolParts(turn) {
 
 /**
  * Settle the active turn's promise (once).
+ *
+ * Idempotent by design (`turn.settled`): a duplicate or late terminal signal —
+ * a second `session.idle`, an `error` after a local abort — is a no-op rather
+ * than a second settle. The authoritative, session-scoped terminal *marker* is
+ * emitted separately by `_emitTurnEndOnce()` from the send/shell completion
+ * paths, so the wire order stays `[MESSAGE_END] [STREAM_END] [TURN_END]`.
+ *
+ * @param {object} turn
+ * @param {{ success?: boolean, error?: any, reason?: string }} [opts]
  */
-function _settleTurn(turn, { success, error }) {
+function _settleTurn(turn, { success, error, reason } = {}) {
   if (turn.settled) return;
   turn.settled = true;
-  _reconcileToolParts(turn);
+  turn.settleReason = reason || (success ? 'idle' : 'error');
+  // Tool-part reconciliation can emit `[MESSAGE]` blocks, including on the
+  // watchdog path where there is no ambient identity — so give it one.
+  runWithIdentity(
+    {
+      id: turn.requestId ?? null,
+      sessionId: turn.sessionId ?? null,
+      turnId: turn.turnId ?? null,
+    },
+    () => _reconcileToolParts(turn),
+  );
   turn.success = success;
   if (success) {
     turn.resolve({ ok: true });
@@ -889,10 +1024,45 @@ function _settleTurn(turn, { success, error }) {
   }
 }
 
-function _createTurn(requestId = null) {
+/**
+ * Emit the turn's session-scoped terminal marker, exactly once.
+ *
+ * Called from the send/shell completion paths *after* the stream has been
+ * closed, so a turn is declared over only once its last content has been
+ * delivered. Carries `sessionId` + `turnId` so the receiver can clear the
+ * correct session's running state even when that session is not the active one
+ * (INV-C), and so a duplicate/late one for an already-settled turn is ignored.
+ *
+ * @param {object} turn
+ * @param {'idle'|'aborted'|'error'|'timeout'|'disconnected'} reason
+ */
+function _emitTurnEndOnce(turn, reason) {
+  if (!turn || turn.turnEndEmitted) return;
+  turn.turnEndEmitted = true;
+  runWithIdentity(
+    {
+      id: turn.requestId ?? null,
+      sessionId: turn.sessionId ?? null,
+      turnId: turn.turnId ?? null,
+    },
+    () => emitTurnEnd({ sessionId: turn.sessionId, turnId: turn.turnId, reason }),
+  );
+}
+
+/**
+ * @param {string|null} requestId - the request this turn answers (control plane)
+ * @param {string} sessionId - the session the turn belongs to (data plane)
+ */
+function _createTurn(requestId = null, sessionId = null) {
   const now = Date.now();
   return {
     requestId,
+    sessionId,
+    // `turnId` is stamped from the first SSE event's `durable.seq`; null until
+    // then (and on servers that don't provide one).
+    turnId: null,
+    settleReason: null,
+    turnEndEmitted: false,
     createdAt: now,
     lastActivityAt: now,
     settled: false,
@@ -916,6 +1086,10 @@ function _createTurn(requestId = null) {
     toolNames: new Map(),
     // 最近一次 session.status:retry 的人话原因，供 180s 兜底文案引用。
     lastStatusMessage: null,
+    // callIDs whose question prompt has already been emitted. Tool input
+    // arrives incrementally (`session.tool.input` can fire several times for
+    // one call), so without this the webview would pop the same dialog again.
+    questionPrompted: new Set(),
   };
 }
 
@@ -950,29 +1124,122 @@ export function _resolveToolCallId(propsOrPart, turn) {
 /**
  * Resolve the session for a request: reuse the caller's id when it exists,
  * otherwise create a new session.
+ *
+ * `selection` ({ agent, model, variant }) is forwarded to session creation so a
+ * brand-new v2 session starts on the agent/model the user picked. v1 ignores it
+ * — there the selection travels on every prompt instead.
+ *
  * @param {string|null} requestedId
  * @param {string} directory
+ * @param {{agent?: string, model?: object|null, variant?: string}} [selection]
  * @returns {Promise<{ id: string, created: boolean }>}
  */
-async function _resolveSession(requestedId, directory) {
+async function _resolveSession(requestedId, directory, selection) {
   if (requestedId) {
     try {
       const existing = await sdk.getSession(requestedId, directory);
       if (existing?.id) {
-        trackSession(existing.id, { directory, revert: existing.revert });
-        return { id: existing.id, created: false };
+        const existingDir = existing.location?.directory || existing.directory;
+        if (existingDir && directory && sdk.normalizeDirForMatch(existingDir) !== sdk.normalizeDirForMatch(directory)) {
+          logWarn('opencode-daemon-service', `Session ${requestedId} directory mismatch: session belongs to ${existingDir}, requested directory is ${directory}. Discarding stale session ID and creating new session.`);
+        } else {
+          trackSession(existing.id, { directory: existingDir || directory, revert: existing.revert });
+          return { id: existing.id, created: false };
+        }
       }
     } catch (err) {
       logDebug('getSession failed, will create:', err?.message || err);
     }
   }
-  const created = await sdk.createSession('', directory);
+  const created = await sdk.createSession('', directory, selection);
   const id = created?.id;
   if (!id) {
     throw new Error(`opencode createSession returned no id: ${JSON.stringify(created)}`);
   }
   trackSession(id, { directory, revert: created.revert });
   return { id, created: true };
+}
+
+/**
+ * Session-scoped agent/model for opencode v2.
+ *
+ * v2 stores the selection on the session, so it must be pushed at three points
+ * rather than on every turn:
+ *
+ *   1. session creation   — handled by `createSession(..., selection)`
+ *   2. the user changing it — the next send sees a different key
+ *   3. switching back to a session (tab switch) — `_lastSelectionSessionId`
+ *      differs, which forces one re-apply even when the values look identical
+ *
+ * The point of (3) is calibration: a user may have changed the model from the
+ * TUI, so the plugin's view can be stale. Re-applying on activation makes the
+ * two converge without paying a round-trip on every message.
+ *
+ * Deliberately NOT a value cache that suppresses calls: `_appliedSelections`
+ * only answers "has this exact selection been pushed for this session since it
+ * was last activated". Same session + same selection + no switch => skip.
+ */
+let _lastSelectionSessionId = null;
+const _appliedSelections = new Map();
+/**
+ * Upper bound for the marker map.
+ *
+ * The daemon has no session-close hook (the host closes tabs locally), so an
+ * unbounded map would grow with every session ever touched. Markers are tiny
+ * and a miss only costs one redundant re-apply, so evicting the oldest is safe.
+ */
+const _APPLIED_SELECTION_LIMIT = 256;
+
+/** Key used to detect that the selection changed within one activation. */
+function _selectionKey(agent, modelRef, variant) {
+  return [
+    agent || '',
+    modelRef ? `${modelRef.providerID}/${modelRef.id}` : '',
+    variant || '',
+  ].join('|');
+}
+
+async function _syncSessionSelection(sessionId, { agent, model, variant }) {
+  // v1 carries agent/model/variant on the prompt itself; nothing to push.
+  if (!engineRegistry.isV2()) return;
+  if (!sessionId) return;
+
+  const modelRef = sdk.toV2ModelRef(model, variant);
+  const key = _selectionKey(agent, modelRef, variant);
+  const switched = _lastSelectionSessionId !== sessionId;
+  _lastSelectionSessionId = sessionId;
+
+  if (!switched && _appliedSelections.get(sessionId) === key) {
+    return;
+  }
+
+  try {
+    if (agent) await sdk.setSessionAgent(sessionId, agent);
+    if (modelRef) await sdk.setSessionModel(sessionId, modelRef);
+    _appliedSelections.set(sessionId, key);
+    if (_appliedSelections.size > _APPLIED_SELECTION_LIMIT) {
+      const oldest = _appliedSelections.keys().next().value;
+      if (oldest !== undefined) _appliedSelections.delete(oldest);
+    }
+    logDebug(
+      `session selection applied: session=${sessionId}`
+      + ` agent=${agent || '-'} model=${modelRef ? `${modelRef.providerID}/${modelRef.id}` : '-'}`
+      + ` variant=${variant || '-'}${switched ? ' (reactivated)' : ''}`
+    );
+  } catch (err) {
+    // Never block the turn on a sync failure: the prompt still works, it may
+    // just run on the previously selected agent/model. Clear the marker so the
+    // next send retries.
+    _appliedSelections.delete(sessionId);
+    logDebug(`session selection sync failed: session=${sessionId}`, err?.message || err);
+  }
+}
+
+/** Forget a closed session's selection marker (kept for hosts that can signal it). */
+export function forgetSessionSelection(sessionId) {
+  if (!sessionId) return;
+  _appliedSelections.delete(sessionId);
+  if (_lastSelectionSessionId === sessionId) _lastSelectionSessionId = null;
 }
 
 // =============================================================================
@@ -998,9 +1265,12 @@ export async function sendMessagePersistent(params = {}) {
   const agent = resolveAgentParam(safeParams);
   const model = resolveModelParam(safeParams.model);
   // 推理力度 → opencode model variant（docs/models#variants，按模型变化）。
-  const variant = (typeof safeParams.reasoningEffort === 'string' && safeParams.reasoningEffort.trim())
-    ? safeParams.reasoningEffort.trim()
-    : undefined;
+  // 'default' is not a real variant: it means "send none" so opencode applies the
+  // model's own catalog settings (a session with no variant reports back
+  // `variant: "default"`). Normalising it here keeps v1 (prompt body) and v2
+  // (Model.Ref) identical — neither engine ever receives the literal 'default'.
+  const rawEffort = (typeof safeParams.reasoningEffort === 'string') ? safeParams.reasoningEffort.trim() : '';
+  const variant = (rawEffort && rawEffort !== 'default') ? rawEffort : undefined;
 
   // 斜杠命令经 safeParams.command 走 /session/{id}/command（见下方分支）。
   if (safeParams.prompt) {
@@ -1008,7 +1278,22 @@ export async function sendMessagePersistent(params = {}) {
   }
 
   // ── Resolve/create the session ──────────────────────────────────────────
-  const { id: sessionId, created } = await _resolveSession(requestedId, directory);
+  const { id: sessionId, created } = await _resolveSession(
+    requestedId,
+    directory,
+    { agent, model, variant },
+  );
+  // v2 keeps agent/model/variant on the session, so a fresh session already has
+  // them (seeded at creation) and an existing one needs them re-applied when the
+  // user changed the selection or switched back to this session.
+  if (!created) {
+    await _syncSessionSelection(sessionId, { agent, model, variant });
+  }
+  // Bind the identity before emitting anything: every line below (including
+  // `emitSessionId` for a server-normalized id) must be attributable to this
+  // session. A brand-new session's id only exists from here on, which is why
+  // the record is mutated rather than passed in.
+  bindSession(sessionId);
   if (!created && requestedId !== sessionId) {
     // Caller passed an id we normalized; surface it so the host reuses ours.
     emitSessionId(sessionId);
@@ -1101,37 +1386,18 @@ export async function sendMessagePersistent(params = {}) {
   emitSessionId(sessionId);
 
   const currentReqId = requestContext.getStore()?.id ?? null;
-  const turn = _createTurn(currentReqId);
+  const turn = _createTurn(currentReqId, sessionId);
   turn.promise = new Promise((resolve, reject) => {
     turn.resolve = resolve;
     turn.reject = reject;
   });
   _activeTurns.set(sessionId, turn);
-  // 新回合开始，上一个"本地超时"登记作废——否则它的迟到错误会被错记到本回合。
-  _timedOutTurns.delete(sessionId);
 
   logDebug(
     `send session=${sessionId} agent=${agent || '-'} model=${safeParams.model || '-'}`
     + ` command=${validSlashCommand || '-'} attachments=${fileParts.length}`
     + ` skipped=${attachmentErrors.length} promptLen=${promptText.length}`
   );
-
-  // 超时兜底必须在**发起请求之前**建好计时器。原来它是在 `await
-  // sdk.promptAsync()` 之后才创建的，于是 promptAsync 自身挂住（连接建立后
-  // 不再返回）时，`Promise.race` 根本没机会执行，180s 兜底形同虚设——这正是
-  // "一直转、什么都不报"的最长路径。
-  let turnTimer = null;
-  let timedOut = false;
-  const timeoutPromise = new Promise((_, reject) => {
-    turnTimer = setTimeout(() => {
-      timedOut = true;
-      // 文案带上服务端已经给过的原话（额度/限流原因），没有才退回泛化描述。
-      const detail = turn.lastStatusMessage
-        ? `服务端返回：${turn.lastStatusMessage}`
-        : '服务端在此期间未返回任何状态';
-      reject(new Error(`OpenCode 请求等待超时 (${Math.round(TURN_TIMEOUT_MS / 1000)}s)。${detail}`));
-    }, TURN_TIMEOUT_MS);
-  });
 
   try {
     if (validSlashCommand) {
@@ -1158,20 +1424,17 @@ export async function sendMessagePersistent(params = {}) {
     }
 
     // Wait for session.idle / session.error / abort to settle the turn.
-    await Promise.race([turn.promise, timeoutPromise]);
+    await turn.promise;
   } catch (err) {
-    // 本地超时后服务端的真实失败仍会迟到。登记该会话，让迟到的
-    // session.error 走 [TURN_ERROR] 而不是被当成压缩结果丢掉。
-    if (timedOut && !turn.aborted) {
-      _timedOutTurns.set(sessionId, { at: Date.now() });
-    }
     if (turn.aborted) {
       // Graceful abort — clean "interrupted" result, no error toast.
       endStream({ sessionId });
+      _emitTurnEndOnce(turn, 'aborted');
       console.log(JSON.stringify({ success: false, error: 'User interrupted', elapsedMs: Date.now() - startedAt }));
       return;
     }
     endStream({ sessionId });
+    _emitTurnEndOnce(turn, turn.settleReason || 'error');
     const rawMsg = err?.message || (typeof err === 'string' ? err : JSON.stringify(err));
     let message = rawMsg;
     try {
@@ -1188,7 +1451,6 @@ export async function sendMessagePersistent(params = {}) {
     emitSendError(message, 'OpenCode');
     return;
   } finally {
-    if (turnTimer) clearTimeout(turnTimer);
     _activeTurns.delete(sessionId);
     // 本回合产生了新的 token 用量，context usage 缓存失效。
     _contextUsageCache.delete(`${sessionId}::${directory || ''}`);
@@ -1204,6 +1466,7 @@ export async function sendMessagePersistent(params = {}) {
   const usage = aggregateTurnUsage(turn, finalMessage);
   if (usage) emitUsage(usage);
   endStream({ sessionId, message: finalMessage || turn.lastInfo || { sessionID: sessionId } });
+  _emitTurnEndOnce(turn, turn.aborted ? 'aborted' : 'idle');
   console.log(JSON.stringify({ success: true, sessionId }));
 }
 
@@ -1234,7 +1497,17 @@ export async function sendShellPersistent(params = {}) {
   }
 
   // ── Resolve/create the session ──────────────────────────────────────────
-  const { id: sessionId, created } = await _resolveSession(requestedId, directory);
+  const { id: sessionId, created } = await _resolveSession(
+    requestedId,
+    directory,
+    { agent, model },
+  );
+  // Shell commands run under the session's agent too (plan mode gates bash), so
+  // the same activation-time sync applies here.
+  if (!created) {
+    await _syncSessionSelection(sessionId, { agent, model });
+  }
+  bindSession(sessionId);
   if (!created && requestedId !== sessionId) {
     emitSessionId(sessionId);
   }
@@ -1244,7 +1517,7 @@ export async function sendShellPersistent(params = {}) {
   emitSessionId(sessionId);
 
   const currentReqId = requestContext.getStore()?.id ?? null;
-  const turn = _createTurn(currentReqId);
+  const turn = _createTurn(currentReqId, sessionId);
   turn.promise = new Promise((resolve, reject) => {
     turn.resolve = resolve;
     turn.reject = reject;
@@ -1273,10 +1546,12 @@ export async function sendShellPersistent(params = {}) {
   } catch (err) {
     if (turn.aborted) {
       endStream({ sessionId });
+      _emitTurnEndOnce(turn, 'aborted');
       console.log(JSON.stringify({ success: false, error: 'User interrupted', elapsedMs: Date.now() - startedAt }));
       return;
     }
     endStream({ sessionId });
+    _emitTurnEndOnce(turn, turn.settleReason === 'disconnected' ? 'disconnected' : 'error');
     const rawMsg = err?.message || (typeof err === 'string' ? err : JSON.stringify(err));
     let message = rawMsg;
     try {
@@ -1300,6 +1575,7 @@ export async function sendShellPersistent(params = {}) {
   const usage = aggregateTurnUsage(turn, finalMessage);
   if (usage) emitUsage(usage);
   endStream({ sessionId, message: finalMessage || turn.lastInfo || { sessionID: sessionId } });
+  _emitTurnEndOnce(turn, turn.aborted ? 'aborted' : 'idle');
   console.log(JSON.stringify({ success: true, sessionId }));
 }
 
@@ -1342,6 +1618,7 @@ export async function preconnectPersistent(params = {}) {
     : null;
   if (requestedId) {
     const { id: sessionId } = await _resolveSession(requestedId, directory);
+    bindSession(sessionId);
     emitSessionId(sessionId);
     console.log(`[STATUS] preconnect ready sessionId=${sessionId} server=${serveManager.getServerUrl() || '-'}`);
   } else {
@@ -1351,8 +1628,15 @@ export async function preconnectPersistent(params = {}) {
 
 /**
  * Abort the active turn(s). Bypasses the command queue in daemon.js (runs
- * immediately, like the claude abort path). The opencode server settles the
- * turn with a `session.error`/`session.idle` which resolves the awaiting send.
+ * immediately, like the claude abort path).
+ *
+ * The turn is settled **locally and immediately** in addition to the HTTP
+ * abort. Waiting for the server to echo a terminal event is not sufficient:
+ * opencode does not always answer an abort, and the old code then sat on
+ * `TURN_TIMEOUT_MS` (180 s) with the UI still spinning — that is literally the
+ * "stop button doesn't stop the spinner" symptom. Settling here makes the local
+ * teardown independent of server behaviour; the HTTP abort still runs so the
+ * server stops generating.
  *
  * @param {string} [targetSessionId] - Optional session ID to abort. If omitted, aborts all active turns.
  */
@@ -1373,7 +1657,16 @@ export async function abortCurrentTurn(targetSessionId) {
   if (sessions.length === 0) return;
   for (const sessionId of sessions) {
     const turn = _activeTurns.get(sessionId);
-    if (turn) turn.aborted = true;
+    if (turn) {
+      turn.aborted = true;
+      // Rejects the awaiting send → it closes the stream and emits
+      // `[TURN_END] {reason:'aborted'}` in the normal, ordered position.
+      _settleTurn(turn, {
+        success: false,
+        error: new Error('User interrupted'),
+        reason: 'aborted',
+      });
+    }
     try {
       await sdk.abort(sessionId);
     } catch (err) {

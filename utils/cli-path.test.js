@@ -8,6 +8,7 @@ import {
   commonCliBinDirs,
   resolveCliPath,
   resolveOpenCodeCliPath,
+  probeSystemNode,
 } from './cli-path.js';
 
 test('isWindowsCmdShim detects .cmd/.bat only on win32-style paths', () => {
@@ -191,4 +192,38 @@ test('resolveOpenCodeCliPath returns non-empty string', () => {
   const resolved = resolveOpenCodeCliPath();
   assert.equal(typeof resolved, 'string');
   assert.ok(resolved.length > 0);
+});
+
+test('probeSystemNode prefers the host-injected OPENCODEBUDDY_NODE_BIN', () => {
+  // An IDE-launched daemon inherits a sparse PATH, so "node from PATH" is often a
+  // different runtime than the one the host is configured to use. The injected
+  // value must win, and the source must stay attributable.
+  const original = process.env.OPENCODEBUDDY_NODE_BIN;
+  try {
+    process.env.OPENCODEBUDDY_NODE_BIN = '/injected/node';
+    const result = probeSystemNode();
+    assert.ok(result, 'expected a result when the host injected a node path');
+    assert.equal(result.path, '/injected/node');
+    assert.equal(result.source, 'settings');
+    assert.equal(typeof result.version, 'string');
+  } finally {
+    if (original === undefined) {
+      delete process.env.OPENCODEBUDDY_NODE_BIN;
+    } else {
+      process.env.OPENCODEBUDDY_NODE_BIN = original;
+    }
+  }
+});
+
+test('probeSystemNode falls back to PATH and labels the source', () => {
+  const original = process.env.OPENCODEBUDDY_NODE_BIN;
+  try {
+    delete process.env.OPENCODEBUDDY_NODE_BIN;
+    const result = probeSystemNode();
+    assert.ok(result === null || result.source === 'path');
+  } finally {
+    if (original !== undefined) {
+      process.env.OPENCODEBUDDY_NODE_BIN = original;
+    }
+  }
 });

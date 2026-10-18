@@ -114,16 +114,19 @@ test('buildSdkModelEntry keeps variants alongside the context window', () => {
   assert.equal(entry.contextWindow, 200000);
 });
 
-test('buildSdkModelEntry omits variants when all variants are disabled or empty', () => {
+test('buildSdkModelEntry reports an explicit empty list when no variant is usable', () => {
   const allDisabled = buildSdkModelEntry('anthropic', 'Anthropic', 'claude-sonnet-5', {
     variants: { v1: { disabled: true }, v2: { disabled: true } },
   });
-  assert.equal('variants' in allDisabled, false);
+  // Present-and-empty means "this model has no usable variants" → the UI hides
+  // the selector. Absent means "unknown" (opencode v1 ships no catalog) → the UI
+  // keeps its legacy list. The two must not be collapsed into one.
+  assert.deepEqual(allDisabled.variants, []);
 
   const emptyVariants = buildSdkModelEntry('anthropic', 'Anthropic', 'claude-sonnet-5', {
     variants: {},
   });
-  assert.equal('variants' in emptyVariants, false);
+  assert.deepEqual(emptyVariants.variants, []);
 });
 
 test('parseOpenCodeModelsOutput parses tab-delimited output with multiple columns', () => {
@@ -131,4 +134,49 @@ test('parseOpenCodeModelsOutput parses tab-delimited output with multiple column
   const models = parseOpenCodeModelsOutput(out);
   assert.deepEqual(models.map((m) => m.id), ['opencode/nemotron-3-ultra-free', 'openai/gpt-5.5']);
   assert.equal(models[0].label, 'Nemotron-3-Ultra-Free');
+});
+
+// ---------------------------------------------------------------------------
+// Variant tri-state
+//
+// opencode exposes `variants` per model, and the set differs wildly: some models
+// have none at all, deepseek/glm only have low/high/max, others add xhigh. The
+// UI needs to tell "this model has none" (hide the selector) apart from "we don't
+// know" (opencode v1 ships no catalog → keep the legacy list). Collapsing both to
+// `undefined` made the selector offer `high` on models that reject it, and every
+// send failed with `Variant unavailable`.
+// ---------------------------------------------------------------------------
+
+test('buildSdkModelEntry reports an empty variant list as an explicit empty array', () => {
+  const entry = buildSdkModelEntry('opencode', 'OpenCode', 'mimo-v2.6-flash-free', {
+    name: 'Mimo',
+    variants: {},
+  });
+  // Must be present-and-empty, NOT absent: absent means "unknown".
+  assert.deepEqual(entry.variants, []);
+});
+
+test('buildSdkModelEntry omits variants entirely when the catalog has no field', () => {
+  const entry = buildSdkModelEntry('opencode', 'OpenCode', 'legacy-model', { name: 'Legacy' });
+  assert.equal('variants' in entry, false);
+});
+
+test('buildSdkModelEntry keeps only enabled variants and drops disabled ones', () => {
+  const entry = buildSdkModelEntry('opencode', 'OpenCode', 'deepseek', {
+    name: 'DeepSeek',
+    variants: {
+      low: {},
+      high: { reasoningEffort: 'high' },
+      max: { disabled: true },
+    },
+  });
+  assert.deepEqual(entry.variants, ['low', 'high']);
+});
+
+test('buildSdkModelEntry accepts the v2 array form of variants', () => {
+  const entry = buildSdkModelEntry('opencode', 'OpenCode', 'beam-free', {
+    name: 'Beam',
+    variants: [{ id: 'low' }, { id: 'xhigh' }],
+  });
+  assert.deepEqual(entry.variants, ['low', 'xhigh']);
 });

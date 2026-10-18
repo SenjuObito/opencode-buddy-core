@@ -9,13 +9,64 @@
  *   { sessionID, directory, model, agent, parts, ... }
  * NOT the v1 nested format:
  *   { path: { id }, query: { directory }, body: { ... } }
+ *
+ * Routing: every exported function branches on `engineRegistry.isV2()`. That is
+ * a *synchronous, side-effect-free* read, which is only safe because each
+ * request path passes through `engineRegistry.ensure()` first — at the request
+ * boundary in the two entry points (daemon.js dispatch, channel-manager's
+ * handleOpenCodeCommand) and again in `_ensureReady` / `ensureServerReady`.
+ * `ensure()` either locks a verified mode or throws EngineUnresolvedError, so a
+ * request can never be sent down a guessed route (ADR-3).
  */
 
 import { createOpencodeClient } from '@opencode-ai/sdk/v2';
 import * as serveManager from './opencode-serve-manager.js';
+import * as engineRegistry from './engine-registry.js';
+import { registerPendingCompaction, resolvePendingCompaction } from './compaction-tracker.js';
 
 let _client = null;
 let _baseUrl = null;
+
+export function getEffectiveBaseUrl() {
+  return _baseUrl || serveManager.getServerUrl() || serveManager.tryReadServiceInfo()?.url || 'http://localhost:4096';
+}
+
+export function getBaseUrl() {
+  return getEffectiveBaseUrl();
+}
+
+/**
+ * Neutral notice for a user-initiated stop.
+ *
+ * The server records "the user pressed stop" as `finish: 'error'` with
+ * `error.type: 'aborted'` / `error.message: 'Step interrupted'`. Rendering that
+ * verbatim — as `[Error: Step interrupted]` — reads like a crash in the middle
+ * of the transcript. `aborted: true` rides along so the host can style it as a
+ * state notice instead of an error bubble.
+ */
+const ABORTED_NOTICE = '已停止生成';
+
+/**
+ * Flatten a v2 tool result `content` array (`[{type:'text', text}]`) into text.
+ *
+ * v2 moved tool output out of `state.output` and into this array; reading only
+ * `output` silently dropped every tool result on restore (the tool_use block
+ * showed up with an empty result). v1 keeps the plain-string form, so a string
+ * passes straight through.
+ */
+function flattenToolContent(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const parts = [];
+  for (const c of content) {
+    if (typeof c === 'string') {
+      parts.push(c);
+    } else if (c && typeof c === 'object' && typeof c.text === 'string') {
+      parts.push(c.text);
+    }
+  }
+  return parts.join('\n');
+}
 
 function getAuthHeader() {
   const pwd = serveManager.getServerPassword();
@@ -74,11 +125,12 @@ async function* subscribeEventsV2(baseUrl, password, directory, signal) {
  * @param {string} [baseUrl] - server URL (http://localhost:4096)
  * @returns {ReturnType<typeof createOpencodeClient>}
  */
-export function getClient(baseUrl = 'http://localhost:4096') {
-  if (!_client || _baseUrl !== baseUrl) {
-    _baseUrl = baseUrl;
+export function getClient(baseUrl) {
+  const effective = baseUrl || getEffectiveBaseUrl();
+  if (!_client || _baseUrl !== effective) {
+    _baseUrl = effective;
     _client = createOpencodeClient({
-      baseUrl,
+      baseUrl: effective,
       fetch: async (req) => {
         const pwd = serveManager.getServerPassword();
         if (pwd && !req.headers.has('authorization')) {
@@ -122,8 +174,8 @@ export function setBaseUrl(baseUrl) {
  */
 export async function health() {
   try {
-    if (serveManager.isV2()) {
-      const url = `${_baseUrl || 'http://localhost:4096'}/api/info`;
+    if (engineRegistry.isV2()) {
+      const url = `${getEffectiveBaseUrl()}/api/info`;
       const res = await fetch(url, { headers: getAuthHeader() });
       return res.status === 200;
     }
@@ -142,12 +194,19 @@ export async function health() {
  * @param {string} [directory]
  * @returns {Promise<object>} the created session (with `id`)
  */
-export async function createSession(title, directory) {
-  if (serveManager.isV2()) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session`;
+export async function createSession(title, directory, selection) {
+  if (engineRegistry.isV2()) {
+    const url = `${getEffectiveBaseUrl()}/api/session`;
     const body = {};
     if (title) body.title = title;
     if (directory) body.location = { directory };
+    // v2 makes agent/model session-scoped, so creation is the natural place to
+    // seed them: `POST /prompt` cannot carry either, and doing it here means a
+    // brand-new session's first turn already runs on the right agent/model
+    // instead of the catalog default.
+    if (selection && selection.agent) body.agent = selection.agent;
+    const modelRef = toV2ModelRef(selection && selection.model, selection && selection.variant);
+    if (modelRef) body.model = modelRef;
     const res = await fetch(url, {
       method: 'POST',
       headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
@@ -172,7 +231,7 @@ export async function createSession(title, directory) {
 /**
  * Normalize path for directory comparison (cross-platform, case-insensitive on Windows).
  */
-function normalizeDirForMatch(p) {
+export function normalizeDirForMatch(p) {
   if (!p || typeof p !== 'string') return '';
   let normalized = p.replace(/\\/g, '/');
   if (process.platform === 'win32') {
@@ -187,11 +246,11 @@ function normalizeDirForMatch(p) {
  * @returns {Promise<object[]>}
  */
 export async function listSessions(directory, limit) {
-  if (serveManager.isV2()) {
+  if (engineRegistry.isV2()) {
     const query = new URLSearchParams();
     if (limit && Number(limit) > 0) query.set('limit', String(limit));
     const qs = query.toString();
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session${qs ? `?${qs}` : ''}`;
+    const url = `${getEffectiveBaseUrl()}/api/session${qs ? `?${qs}` : ''}`;
     const res = await fetch(url, {
       headers: getAuthHeader(),
     });
@@ -214,15 +273,14 @@ export async function listSessions(directory, limit) {
     });
 
     // Robust directory filtering for Windows (case-insensitive & slash-normalized)
-    if (directory && typeof directory === 'string' && directory.trim() && unifiedList.length > 0) {
+    if (directory && typeof directory === 'string' && directory.trim()) {
+      if (unifiedList.length === 0) return [];
       const target = normalizeDirForMatch(directory.trim());
       const filtered = unifiedList.filter(s => {
         const sessionDir = s.directory;
         return sessionDir && normalizeDirForMatch(sessionDir) === target;
       });
-      // Fallback: if project-specific match has sessions, return them;
-      // otherwise return all sessions so history list is never completely empty
-      return filtered.length > 0 ? filtered : unifiedList;
+      return filtered;
     }
 
     return unifiedList;
@@ -243,9 +301,9 @@ export async function listSessions(directory, limit) {
  * @returns {Promise<object | null>}
  */
 export async function getSession(id, directory) {
-  if (serveManager.isV2()) {
+  if (engineRegistry.isV2()) {
     try {
-      const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(id)}`;
+      const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(id)}`;
       const res = await fetch(url, { headers: getAuthHeader() });
       if (!res.ok) return null;
       const json = await res.json();
@@ -267,8 +325,8 @@ export async function getSession(id, directory) {
  * @returns {Promise<void>}
  */
 export async function deleteSession(id, directory) {
-  if (serveManager.isV2()) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(id)}`;
+  if (engineRegistry.isV2()) {
+    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(id)}`;
     const res = await fetch(url, {
       method: 'DELETE',
       headers: getAuthHeader(),
@@ -293,8 +351,8 @@ export async function deleteSession(id, directory) {
  * @returns {Promise<object>}
  */
 export async function updateSessionTitle(id, title, directory) {
-  if (serveManager.isV2()) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(id)}`;
+  if (engineRegistry.isV2()) {
+    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(id)}`;
     const res = await fetch(url, {
       method: 'PATCH',
       headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
@@ -321,8 +379,8 @@ export async function updateSessionTitle(id, title, directory) {
  * @returns {Promise<object>}
  */
 export async function updateSessionMetadata(id, metadata, directory) {
-  if (serveManager.isV2()) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(id)}`;
+  if (engineRegistry.isV2()) {
+    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(id)}`;
     const res = await fetch(url, {
       method: 'PATCH',
       headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
@@ -415,16 +473,104 @@ function redactParamsForLog(params) {
   };
 }
 
+/**
+ * Convert the host-side model ref to the shape opencode v2 expects.
+ *
+ * v1 and the host speak `{ providerID, modelID }`; v2's `Model.Ref` is
+ * `{ id, providerID, variant }` with `required: [id, providerID]` and
+ * `additionalProperties: false`. Sending `modelID` there is rejected, so the
+ * rename has to happen exactly once, here.
+ *
+ * Returns null when the provider is unknown — `Model.Ref` requires a provider,
+ * and a bare model id cannot be resolved without one.
+ */
+export function toV2ModelRef(model, variant) {
+  if (!model || typeof model !== 'object') return null;
+  const id = model.modelID || model.id;
+  const providerID = model.providerID;
+  if (!id || typeof id !== 'string' || !providerID || typeof providerID !== 'string') {
+    return null;
+  }
+  const ref = { id, providerID };
+  // 'default' is the UI's "use the model default" — it must NOT be forwarded as
+  // a variant, or opencode would look up a level that no model declares. Omitting
+  // the field is what actually produces `variant: "default"` server-side.
+  const normalized = typeof variant === 'string' ? variant.trim() : '';
+  if (normalized && normalized !== 'default') ref.variant = normalized;
+  return ref;
+}
+
+/**
+ * Set the agent for one session (v2 only).
+ *
+ * v2 moved agent/model from message scope to session scope: `POST /prompt` has
+ * no `agent` field, so passing one there is silently ignored. The session keeps
+ * whatever it was created with until this endpoint changes it.
+ *
+ * Returns false on v1 (callers fall back to the prompt body) so the same call
+ * site can serve both engines.
+ */
+export async function setSessionAgent(sessionId, agent) {
+  if (!engineRegistry.isV2()) return false;
+  if (!sessionId || !agent || typeof agent !== 'string' || !agent.trim()) return false;
+  const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/agent`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent: agent.trim() }),
+  });
+  if (!res.ok) {
+    throw new Error(`Set session agent failed: HTTP ${res.status} ${await res.text()}`);
+  }
+  return true;
+}
+
+/**
+ * Set the model (and its reasoning variant) for one session (v2 only).
+ *
+ * `variant` rides on `Model.Ref` — v2 has no separate reasoning-effort channel,
+ * so this is the only place `high` / `medium` can be expressed.
+ */
+export async function setSessionModel(sessionId, modelRef) {
+  if (!engineRegistry.isV2()) return false;
+  if (!sessionId || !modelRef || typeof modelRef !== 'object') return false;
+  if (!modelRef.id || !modelRef.providerID) return false;
+  const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/model`;
+
+  const post = (payload) => fetch(url, {
+    method: 'POST',
+    headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: payload }),
+  });
+
+  const res = await post(modelRef);
+  if (res.ok) return true;
+
+  const errText = await res.text();
+  // A model may not offer the requested reasoning variant (`low`/`high`/`max`
+  // come from each model's own catalog entry; several models have none at all).
+  // Dropping the variant still honours the user's *model* choice, whereas
+  // failing the whole request blocks the turn. Only retry for that specific
+  // rejection — any other error must surface unchanged.
+  if (modelRef.variant && /variant/i.test(errText)) {
+    const retry = await post({ id: modelRef.id, providerID: modelRef.providerID });
+    if (retry.ok) return true;
+    throw new Error(`Set session model failed: HTTP ${retry.status} ${await retry.text()}`);
+  }
+  throw new Error(`Set session model failed: HTTP ${res.status} ${errText}`);
+}
+
 export async function promptAsync(sessionId, text, options = {}) {
-  if (serveManager.isV2()) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/prompt`;
+  if (engineRegistry.isV2()) {
+    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/prompt`;
+    // v2's prompt body accepts only {id, text, files, agents, skills, metadata,
+    // delivery, resume}. `agent`, `model`, `system` and `tools` are NOT part of
+    // it — v1 accepted them there, which is why this file used to forward them
+    // and why v2 silently ran every turn on the session's old agent/model.
+    // Session selection is applied separately via setSessionAgent/setSessionModel.
     const body = {
       text,
     };
-    if (options.agent) body.agent = options.agent;
-    if (options.model) body.model = options.model;
-    if (options.system) body.system = options.system;
-    if (options.tools) body.tools = options.tools;
 
     const files = [];
     const sourceParts = Array.isArray(options.parts) ? options.parts : [];
@@ -507,18 +653,21 @@ export async function shellAsync(sessionId, command, options = {}) {
     ? options.agent.trim()
     : 'build';
 
-  const baseUrl = _baseUrl || 'http://localhost:4096';
-  const isV2Server = serveManager.isV2();
+  const baseUrl = getEffectiveBaseUrl();
 
-  // OpenCode REST API routing:
-  // v2 API: /session/{sessionID}/shell (no /api prefix)
-  // v1 API: /api/session/{sessionId}/shell (with /api prefix)
-  const primaryUrl = isV2Server
-    ? `${baseUrl}/session/${encodeURIComponent(sessionId)}/shell`
-    : `${baseUrl}/api/session/${encodeURIComponent(sessionId)}/shell`;
-  const fallbackUrl = isV2Server
-    ? `${baseUrl}/api/session/${encodeURIComponent(sessionId)}/shell`
-    : `${baseUrl}/session/${encodeURIComponent(sessionId)}/shell`;
+  // OpenCode REST API routing (verified against the server's /openapi.json):
+  // every route is served under the /api prefix — /api/session/{id}/shell.
+  // The bare /session/{id}/shell form is NOT a route; it hits the web UI's SPA
+  // fallback (200 + text/html).
+  //
+  // Order is deliberately independent of the engine mode: v1 already used the
+  // /api form first (and kept the bare form as a fallback), so keeping that
+  // order for both engines changes nothing for v1 and fixes the v2 primary,
+  // which used to spend its first request on a route that only ever returned
+  // the SPA HTML.
+  const prefixlessUrl = `${baseUrl}/session/${encodeURIComponent(sessionId)}/shell`;
+  const primaryUrl = `${baseUrl}/api/session/${encodeURIComponent(sessionId)}/shell`;
+  const fallbackUrl = prefixlessUrl;
 
   const body = { command, agent };
   if (options.model) body.model = options.model;
@@ -569,8 +718,8 @@ export async function shellAsync(sessionId, command, options = {}) {
  * @returns {Promise<object>}
  */
 export async function sendCommand(sessionId, command, options = {}) {
-  if (serveManager.isV2()) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/command`;
+  if (engineRegistry.isV2()) {
+    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/command`;
     const body = {
       name: command,
       text: options.arguments ?? '',
@@ -614,8 +763,8 @@ export async function sendCommand(sessionId, command, options = {}) {
  * @returns {Promise<void>}
  */
 export async function abort(sessionId, directory) {
-  if (serveManager.isV2()) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/interrupt`;
+  if (engineRegistry.isV2()) {
+    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/interrupt`;
     await fetch(url, {
       method: 'POST',
       headers: getAuthHeader(),
@@ -646,16 +795,26 @@ export async function abort(sessionId, directory) {
  * @returns {Promise<void>}
  */
 export async function summarizeSession(sessionId, directory, model) {
-  if (serveManager.isV2()) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/compact`;
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    });
-    if (!res.ok) {
-      throw new Error(`Summarize failed: HTTP ${res.status} ${await res.text()}`);
+  if (engineRegistry.isV2()) {
+    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/compact`;
+    const waitPromise = registerPendingCompaction(sessionId, 60000);
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+    } catch (err) {
+      resolvePendingCompaction(sessionId, false, err?.message || String(err));
+      throw err;
     }
+    if (!res.ok) {
+      const errText = await res.text();
+      resolvePendingCompaction(sessionId, false, `HTTP ${res.status}: ${errText}`);
+      throw new Error(`Summarize failed: HTTP ${res.status} ${errText}`);
+    }
+    await waitPromise;
     return;
   }
 
@@ -764,18 +923,32 @@ export async function unshareSession(sessionId, directory) {
  * @returns {Promise<object | null>} updated session
  */
 export async function revertSession(sessionId, messageID, directory) {
-  if (serveManager.isV2()) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/revert`;
-    const res = await fetch(url, {
+  if (engineRegistry.isV2()) {
+    const headers = { ...getAuthHeader(), 'Content-Type': 'application/json' };
+    if (directory) {
+      headers['x-opencode-directory'] = encodeURIComponent(directory);
+    }
+    const query = directory ? `?directory=${encodeURIComponent(directory)}` : '';
+    const stageUrl = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/revert/stage${query}`;
+    let res = await fetch(stageUrl, {
       method: 'POST',
-      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(messageID ? { messageID } : {}),
     });
-    if (!res.ok) {
-      throw new Error(`Revert failed: HTTP ${res.status}`);
+    if (!res.ok && res.status === 404) {
+      const fallbackUrl = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/revert${query}`;
+      res = await fetch(fallbackUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(messageID ? { messageID } : {}),
+      });
     }
-    const json = await res.json();
-    return json.data || json;
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(`Revert failed: HTTP ${res.status}${errText ? ` - ${errText}` : ''}`);
+    }
+    const json = await res.json().catch(() => ({}));
+    return json?.data || json;
   }
 
   const params = { sessionID: sessionId, messageID };
@@ -796,6 +969,46 @@ export async function revertSession(sessionId, messageID, directory) {
  * @returns {Promise<object | null>} updated session
  */
 export async function unrevertSession(sessionId, directory) {
+  if (engineRegistry.isV2()) {
+    const headers = { ...getAuthHeader(), 'Content-Type': 'application/json' };
+    if (directory) {
+      headers['x-opencode-directory'] = encodeURIComponent(directory);
+    }
+    const query = directory ? `?directory=${encodeURIComponent(directory)}` : '';
+    // Primary: OpenCode v2 REST endpoint is DELETE /api/session/{id}/revert
+    const deleteUrl = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/revert${query}`;
+    let res = await fetch(deleteUrl, {
+      method: 'DELETE',
+      headers,
+    });
+    // Fallback: in case an older or alternate v2 build uses POST /revert/clear or /unrevert
+    if (!res.ok && res.status === 404) {
+      const clearUrl = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/revert/clear${query}`;
+      res = await fetch(clearUrl, {
+        method: 'POST',
+        headers,
+      });
+    }
+    if (!res.ok && res.status === 404) {
+      const fallbackUrl = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/unrevert${query}`;
+      res = await fetch(fallbackUrl, {
+        method: 'POST',
+        headers,
+      });
+    }
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(`Unrevert failed: HTTP ${res.status}${errText ? ` - ${errText}` : ''}`);
+    }
+    const text = await res.text().catch(() => '');
+    try {
+      const json = JSON.parse(text);
+      return json?.data || json;
+    } catch {
+      return { success: true };
+    }
+  }
+
   const params = { sessionID: sessionId };
   if (directory) params.directory = directory;
   console.error(`[DEBUG][UnrevertSession] request sessionID=${sessionId}`);
@@ -815,8 +1028,8 @@ export async function unrevertSession(sessionId, directory) {
  * @returns {Promise<object | null>} the forked session (with `id`)
  */
 export async function forkSession(sessionId, messageID, directory) {
-  if (serveManager.isV2()) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/fork`;
+  if (engineRegistry.isV2()) {
+    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/fork`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
@@ -852,8 +1065,8 @@ export async function forkSession(sessionId, messageID, directory) {
  * @returns {Promise<AsyncIterable<object>>}
  */
 export async function subscribeEvents(directory, signal) {
-  if (serveManager.isV2()) {
-    const baseUrl = _baseUrl || 'http://localhost:4096';
+  if (engineRegistry.isV2()) {
+    const baseUrl = getEffectiveBaseUrl();
     const pwd = serveManager.getServerPassword();
     return subscribeEventsV2(baseUrl, pwd, directory, signal);
   }
@@ -873,9 +1086,9 @@ export async function subscribeEvents(directory, signal) {
  * @returns {Promise<object[]>} provider list, each with `.models` keyed by model id
  */
 export async function getProviders(directory) {
-  if (serveManager.isV2()) {
+  if (engineRegistry.isV2()) {
     try {
-      const baseUrl = _baseUrl || 'http://localhost:4096';
+      const baseUrl = getEffectiveBaseUrl();
       const [provRes, modRes] = await Promise.all([
         fetch(`${baseUrl}/api/provider`, { headers: getAuthHeader() }),
         fetch(`${baseUrl}/api/model`, { headers: getAuthHeader() }),
@@ -920,7 +1133,7 @@ export async function getProviders(directory) {
           id: mId,
           name: m.name || mId,
           variants: variantsMap,
-          limit: m.limit || { context: 200000 },
+          ...(m.limit ? { limit: m.limit } : {}),
         };
       }
 
@@ -952,9 +1165,9 @@ export async function getProviders(directory) {
  * @returns {Promise<object[]>} agent list
  */
 export async function getAgents(directory) {
-  if (serveManager.isV2()) {
+  if (engineRegistry.isV2()) {
     try {
-      const url = `${_baseUrl || 'http://localhost:4096'}/api/agent`;
+      const url = `${getEffectiveBaseUrl()}/api/agent`;
       const res = await fetch(url, { headers: getAuthHeader() });
       if (!res.ok) return [];
       const json = await res.json();
@@ -976,9 +1189,9 @@ export async function getAgents(directory) {
  * @returns {Promise<object[]>} command list
  */
 export async function getCommands(directory) {
-  if (serveManager.isV2()) {
+  if (engineRegistry.isV2()) {
     try {
-      const url = `${_baseUrl || 'http://localhost:4096'}/api/command`;
+      const url = `${getEffectiveBaseUrl()}/api/command`;
       const res = await fetch(url, { headers: getAuthHeader() });
       if (!res.ok) return [];
       const json = await res.json();
@@ -1013,8 +1226,8 @@ export async function getCommands(directory) {
  * @returns {Promise<void>}
  */
 export async function replyPermission(sessionId, permissionID, reply, message, directory) {
-  if (serveManager.isV2() && sessionId) {
-    const url = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/permission/${encodeURIComponent(permissionID)}/reply`;
+  if (engineRegistry.isV2() && sessionId) {
+    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/permission/${encodeURIComponent(permissionID)}/reply`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
@@ -1050,72 +1263,109 @@ export async function replyPermission(sessionId, permissionID, reply, message, d
  * @returns {Promise<void>}
  */
 export async function replyQuestion(sessionId, questionID, answers, directory) {
-  if (serveManager.isV2() && sessionId) {
-    let answerObj = {};
-    if (answers && typeof answers === 'object' && !Array.isArray(answers)) {
-      answerObj = answers;
-    } else {
-      // Fetch form info to map array answers onto form field keys
+  const effectiveBaseUrl = getEffectiveBaseUrl();
+
+  // 1. Direct Form API for v2 (OpenCode 2.0.27+ OpenAPI: session.form.reply)
+  if (engineRegistry.isV2() && sessionId) {
+    let targetForm = null;
+    let formID = questionID;
+    if (!questionID.startsWith('frm_')) {
       try {
-        const formUrl = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(questionID)}`;
-        const formRes = await fetch(formUrl, { headers: getAuthHeader() });
-        if (formRes.ok) {
-          const formJson = await formRes.json();
-          const form = formJson.data || formJson;
-          const fields = Array.isArray(form.fields) ? form.fields : [];
-          const answersArr = Array.isArray(answers) ? answers : [];
-          fields.forEach((field, idx) => {
-            const val = answersArr[idx];
-            if (val !== undefined) {
-              if (field.type === 'multiselect') {
-                answerObj[field.key] = Array.isArray(val) ? val : [val];
-              } else {
-                answerObj[field.key] = Array.isArray(val) ? val[0] : val;
-              }
-            }
-          });
+        const formListUrl = `${effectiveBaseUrl}/api/session/${encodeURIComponent(sessionId)}/form`;
+        const listRes = await fetch(formListUrl, { headers: getAuthHeader() });
+        if (listRes.ok) {
+          const formsJson = await listRes.json();
+          const forms = Array.isArray(formsJson.items)
+            ? formsJson.items
+            : (Array.isArray(formsJson.data) ? formsJson.data : (Array.isArray(formsJson) ? formsJson : []));
+          targetForm = forms.find(f =>
+            f.id === questionID ||
+            f.metadata?.tool?.id === questionID ||
+            f.metadata?.tool?.callID === questionID ||
+            f.metadata?.callID === questionID
+          );
+          if (targetForm?.id) {
+            formID = targetForm.id;
+          }
         }
       } catch (err) {
-        console.warn(`[sdk:v2] failed to fetch form info for field mapping:`, err?.message || err);
+        console.warn(`[sdk:v2] list forms failed:`, err?.message || err);
       }
-      if (Object.keys(answerObj).length === 0 && Array.isArray(answers)) {
-        answers.forEach((val, idx) => {
-          answerObj[String(idx)] = Array.isArray(val) ? (val.length === 1 ? val[0] : val) : val;
+    }
+
+    let answerObj = {};
+    if (answers && typeof answers === 'object' && !Array.isArray(answers)) {
+      if (targetForm && Array.isArray(targetForm.fields)) {
+        targetForm.fields.forEach((field, idx) => {
+          const val = answers[field.key] ?? answers[field.label] ?? answers[field.title] ?? answers[field.name] ?? answers[String(idx)];
+          if (val !== undefined) {
+            answerObj[field.key] = Array.isArray(val) && !field.multiple && !field.multiSelect && val.length === 1 ? val[0] : val;
+          }
         });
       }
+      for (const [k, v] of Object.entries(answers)) {
+        if (answerObj[k] === undefined) {
+          answerObj[k] = v;
+        }
+      }
+    } else if (Array.isArray(answers)) {
+      answers.forEach((val, idx) => {
+        let fieldKey = `q${idx}`;
+        let isMulti = false;
+        if (targetForm && Array.isArray(targetForm.fields) && targetForm.fields[idx]) {
+          const f = targetForm.fields[idx];
+          fieldKey = f.key || `q${idx}`;
+          isMulti = f.type === 'multiselect' || Boolean(f.multiple || f.multiSelect);
+        }
+        const unwrapped = Array.isArray(val) && !isMulti && val.length === 1 ? val[0] : val;
+        answerObj[fieldKey] = unwrapped;
+      });
     }
-    const replyUrl = `${_baseUrl || 'http://localhost:4096'}/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(questionID)}/reply`;
-    const res = await fetch(replyUrl, {
-      method: 'POST',
-      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answer: answerObj }),
-    });
-    if (!res.ok) {
-      throw new Error(`replyQuestion failed (${questionID}): HTTP ${res.status} ${await res.text()}`);
+
+    try {
+      const formReplyUrl = `${effectiveBaseUrl}/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(formID)}/reply`;
+      console.log(`[sdk:v2] session.form.reply url=${formReplyUrl} body=`, JSON.stringify({ answer: answerObj }));
+      const formRes = await fetch(formReplyUrl, {
+        method: 'POST',
+        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answer: answerObj }),
+      });
+      if (formRes.ok) {
+        console.error('[DEBUG][OpenCodeDaemon:v2] question form replied ok:', formID);
+        return;
+      }
+      const errText = await formRes.text();
+      console.warn(`[sdk:v2] form reply endpoint returned HTTP ${formRes.status}: ${errText}`);
+    } catch (err) {
+      console.warn(`[sdk:v2] form reply fetch failed:`, err?.message || err);
     }
-    console.error('[DEBUG][OpenCodeDaemon:v2] question form replied ok:', questionID);
-    return;
   }
 
   const client = getClient();
   const formattedAnswers = Array.isArray(answers) ? answers : [];
 
+  // 2. Try standard SDK session-scoped method (compatible with both v1 and v2)
   if (sessionId && client.session?.question?.reply) {
-    console.log(`[sdk] session.question.reply sessionID=${sessionId} requestID=${questionID}`);
-    const result = await client.session.question.reply({
-      sessionID: sessionId,
-      requestID: questionID,
-      questionV2Reply: { answers: formattedAnswers },
-      directory,
-    });
-    console.log(`[sdk] session.question.reply result=${JSON.stringify(result).substring(0, 500)}`);
-    if (!result.error) {
-      console.log(`[sdk] replyQuestion OK (session scope) questionID=${questionID}`);
-      return;
+    try {
+      console.log(`[sdk] session.question.reply sessionID=${sessionId} requestID=${questionID}`);
+      const result = await client.session.question.reply({
+        sessionID: sessionId,
+        requestID: questionID,
+        questionV2Reply: { answers: formattedAnswers },
+        directory,
+      });
+      console.log(`[sdk] session.question.reply result=${JSON.stringify(result).substring(0, 500)}`);
+      if (!result.error) {
+        console.log(`[sdk] replyQuestion OK (session scope) questionID=${questionID}`);
+        return;
+      }
+      console.warn(`[sdk] session.question.reply returned error, trying legacy fallback: ${summarizeError(result.error)}`);
+    } catch (err) {
+      console.warn(`[sdk] session.question.reply exception, trying legacy fallback:`, err?.message || err);
     }
-    console.warn(`[sdk] session.question.reply returned error, falling back to legacy: ${summarizeError(result.error)}`);
   }
 
+  // 3. Legacy SDK fallback (v1)
   const params = {
     requestID: questionID,
     answers: formattedAnswers,
@@ -1137,19 +1387,68 @@ export async function replyQuestion(sessionId, questionID, answers, directory) {
  * @returns {Promise<void>}
  */
 export async function rejectQuestion(sessionId, questionID, directory) {
+  const effectiveBaseUrl = getEffectiveBaseUrl();
+
+  // 1. Direct Form API for v2 (OpenCode 2.0.27+ OpenAPI: session.form.cancel)
+  if (engineRegistry.isV2() && sessionId) {
+    let formID = questionID;
+    if (!questionID.startsWith('frm_')) {
+      try {
+        const formListUrl = `${effectiveBaseUrl}/api/session/${encodeURIComponent(sessionId)}/form`;
+        const listRes = await fetch(formListUrl, { headers: getAuthHeader() });
+        if (listRes.ok) {
+          const formsJson = await listRes.json();
+          const forms = Array.isArray(formsJson.items)
+            ? formsJson.items
+            : (Array.isArray(formsJson.data) ? formsJson.data : (Array.isArray(formsJson) ? formsJson : []));
+          const targetForm = forms.find(f =>
+            f.id === questionID ||
+            f.metadata?.tool?.id === questionID ||
+            f.metadata?.tool?.callID === questionID ||
+            f.metadata?.callID === questionID
+          );
+          if (targetForm?.id) {
+            formID = targetForm.id;
+          }
+        }
+      } catch (err) {
+        console.warn(`[sdk:v2] list forms failed:`, err?.message || err);
+      }
+    }
+
+    try {
+      const rejectUrl = `${effectiveBaseUrl}/api/session/${encodeURIComponent(sessionId)}/form/${encodeURIComponent(formID)}`;
+      const res = await fetch(rejectUrl, {
+        method: 'DELETE',
+        headers: getAuthHeader(),
+      });
+      if (res.ok || res.status === 404) {
+        console.error('[DEBUG][OpenCodeDaemon:v2] question form rejected ok:', formID);
+        return;
+      }
+      console.warn(`[sdk:v2] form cancel endpoint returned HTTP ${res.status}: ${await res.text()}`);
+    } catch (err) {
+      console.warn(`[sdk:v2] form cancel fetch failed:`, err?.message || err);
+    }
+  }
+
   const client = getClient();
   if (sessionId && client.session?.question?.reject) {
-    console.log(`[sdk] session.question.reject sessionID=${sessionId} requestID=${questionID}`);
-    const result = await client.session.question.reject({
-      sessionID: sessionId,
-      requestID: questionID,
-      directory,
-    });
-    if (!result.error) {
-      console.error('[DEBUG][OpenCodeDaemon] question rejected ok (session scope):', questionID);
-      return;
+    try {
+      console.log(`[sdk] session.question.reject sessionID=${sessionId} requestID=${questionID}`);
+      const result = await client.session.question.reject({
+        sessionID: sessionId,
+        requestID: questionID,
+        directory,
+      });
+      if (!result.error) {
+        console.error('[DEBUG][OpenCodeDaemon] question rejected ok (session scope):', questionID);
+        return;
+      }
+      console.warn(`[sdk] session.question.reject returned error, falling back to legacy: ${summarizeError(result.error)}`);
+    } catch (err) {
+      console.warn(`[sdk] session.question.reject exception:`, err?.message || err);
     }
-    console.warn(`[sdk] session.question.reject returned error, falling back to legacy: ${summarizeError(result.error)}`);
   }
 
   const params = { requestID: questionID };
@@ -1197,11 +1496,15 @@ function summarizeError(error) {
  * @returns {Promise<object[]>} message entries `{ info, parts }`
  */
 export async function listMessages(sessionId, directory, options = {}) {
-  if (serveManager.isV2()) {
+  if (engineRegistry.isV2()) {
     // OpenCode REST API routing:
-    // Full messages endpoint is /session/{id}/message (without /api prefix).
-    // /api/session/{id}/message is a paginated cursor endpoint which returns {"data":[]} without cursor args.
-    const url = `${_baseUrl || 'http://localhost:4096'}/session/${encodeURIComponent(sessionId)}/message`;
+    // The message list lives at /api/session/{id}/message. The bare
+    // /session/{id}/message form is NOT a server route: it falls through to the
+    // web UI's SPA handler and answers 200 + text/html, which then blows up as
+    // `Unexpected token '<'` — a JSON parse error that says nothing about the
+    // real problem (a wrong route). Verified against the server's own
+    // /openapi.json route table.
+    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/message`;
     let res;
     try {
       res = await fetch(url, { headers: getAuthHeader() });
@@ -1213,27 +1516,43 @@ export async function listMessages(sessionId, directory, options = {}) {
       if (options.tolerateError) return [];
       throw new Error(`Failed to list messages for session ${sessionId}: HTTP ${res.status}`);
     }
+    // Guard the route, not the payload: an HTML body here always means the SPA
+    // fallback answered, i.e. the engine's route table does not have this path.
+    // Reporting that explicitly is far more actionable than letting res.json()
+    // fail with a syntax error.
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      if (options.tolerateError) return [];
+      throw new Error(
+        `Failed to list messages for session ${sessionId}: ${url} returned `
+        + `${contentType.split(';')[0] || 'no content-type'} instead of JSON `
+        + `(the route does not exist on this engine build)`,
+      );
+    }
     const json = await res.json();
     const list = Array.isArray(json.items)
       ? json.items
       : (Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []));
 
     // OpenCode v2 returns messages in reverse chronological order (newest first).
-    // Sort ascending by time.created/start to guarantee chronological order (oldest first),
+    // Sort ascending by numerical timestamp to guarantee chronological order (oldest first),
     // matching v1 behavior so that user prompts precede assistant responses.
-    const sortedList = [...list].sort((a, b) => {
-      const ta = (a?.time && (a.time.created || a.time.start))
-        || (a?.info?.time && (a.info.time.created || a.info.time.start))
-        || 0;
-      const tb = (b?.time && (b.time.created || b.time.start))
-        || (b?.info?.time && (b.info.time.created || b.info.time.start))
-        || 0;
-      if (ta && tb && ta !== tb) return ta - tb;
+    const extractTimeMs = (m) => {
+      if (!m || typeof m !== 'object') return 0;
+      const raw = m.time?.created ?? m.time?.start ?? m.time ?? m.timestamp ?? m.createdAt
+        ?? m.info?.time?.created ?? m.info?.time?.start ?? m.info?.time ?? m.info?.timestamp ?? 0;
+      if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+      if (typeof raw === 'string') {
+        const parsed = Date.parse(raw);
+        return Number.isFinite(parsed) ? parsed : 0;
+      }
       return 0;
+    };
+
+    const sortedList = [...list].sort((a, b) => {
+      const diff = extractTimeMs(a) - extractTimeMs(b);
+      return Number.isFinite(diff) ? diff : 0;
     });
-    if (list.length > 1 && sortedList.every((item, idx) => item === list[idx])) {
-      sortedList.reverse();
-    }
 
     // Convert/normalize v2 messages to standard { info, parts } entries for host compatibility
     const entries = [];
@@ -1242,6 +1561,16 @@ export async function listMessages(sessionId, directory, options = {}) {
 
       // Case A: Server already returned standard { info, parts } format
       if (m.info && typeof m.info === 'object' && Array.isArray(m.parts)) {
+        if (m.info.role === 'compaction') {
+          m.info.isCompactSummary = true;
+          if (!m.info.compactMetadata) {
+            const summaryPart = m.parts.find(p => p.type === 'text');
+            m.info.compactMetadata = {
+              trigger: 'manual',
+              userContext: summaryPart?.text || '',
+            };
+          }
+        }
         entries.push({
           info: {
             ...m.info,
@@ -1253,7 +1582,27 @@ export async function listMessages(sessionId, directory, options = {}) {
       }
 
       // Case B: Flattened format { type, text, content, ... }
-      if (m.type === 'idle' || m.type === 'compaction') continue;
+      if (m.type === 'idle') continue;
+
+      if (m.type === 'compaction') {
+        const summary = m.summary || m.content || m.text || '';
+        const summaryText = typeof summary === 'string' ? summary : (summary?.text || JSON.stringify(summary));
+        const info = {
+          id: m.id || `compact_${Date.now()}`,
+          role: 'compaction',
+          time: m.time || {},
+          isCompactSummary: true,
+          compactMetadata: {
+            trigger: m.reason || 'manual',
+            userContext: summaryText,
+            ...(m.metadata && typeof m.metadata === 'object' ? m.metadata : {}),
+          },
+          sessionID: sessionId,
+        };
+        const parts = [{ type: 'text', text: summaryText }];
+        entries.push({ info, parts });
+        continue;
+      }
 
       const role = m.type === 'user' ? 'user' : (m.type === 'assistant' ? 'assistant' : m.type);
       const modelStr = m.model ? (m.model.providerID && m.model.id ? `${m.model.providerID}/${m.model.id}` : m.model.id) : undefined;
@@ -1298,7 +1647,10 @@ export async function listMessages(sessionId, directory, options = {}) {
                 state: {
                   status: c.state?.status || 'completed',
                   input: c.input || c.state?.input || {},
-                  output: c.output || c.state?.output || '',
+                  output: (typeof c.output === 'string' && c.output)
+                    || flattenToolContent(c.state?.output)
+                    || flattenToolContent(c.state?.content)
+                    || '',
                   error: c.error || c.state?.error,
                   metadata: c.metadata || c.state?.metadata,
                 },
@@ -1307,9 +1659,20 @@ export async function listMessages(sessionId, directory, options = {}) {
           }
         }
         if (m.error || m.finish === 'error') {
-          const errText = m.error?.message || (typeof m.error === 'string' ? m.error : (m.finish === 'error' ? 'Request ended with error' : ''));
+          const errType = (m.error && typeof m.error === 'object') ? m.error.type : '';
+          const errText = m.error?.message
+            || (typeof m.error === 'string' ? m.error
+              : (m.finish === 'error' ? 'Request ended with error' : ''));
+          // A user-initiated stop is an *outcome*, not a fault. v1 never reached
+          // this branch (it returns the SDK payload untouched), so this shaping
+          const aborted = errType === 'aborted' || /interrupt|abort/i.test(errText || '') || m.finish === 'interrupted';
           if (errText && !parts.some(p => p.type === 'text')) {
-            parts.push({ type: 'text', text: `[Error: ${errText}]` });
+            if (aborted) {
+              info.aborted = true;
+            }
+            parts.push(aborted
+              ? { type: 'text', text: ABORTED_NOTICE, aborted: true }
+              : { type: 'text', text: `[Error: ${errText}]`, isError: true });
           }
         }
       }
@@ -1342,10 +1705,10 @@ export async function listMessages(sessionId, directory, options = {}) {
  * @returns {Promise<Array<{ path: string, type: 'file' | 'directory' }>>}
  */
 export async function findFiles({ query = '', limit = '20', directory } = {}) {
-  if (serveManager.isV2()) {
+  if (engineRegistry.isV2()) {
     try {
       const numLimit = typeof limit === 'number' ? limit : (typeof limit === 'string' ? parseInt(limit, 10) || 20 : 20);
-      const url = `${_baseUrl || 'http://localhost:4096'}/api/fs/find?query=${encodeURIComponent(query || '')}&limit=${numLimit}`;
+      const url = `${getEffectiveBaseUrl()}/api/fs/find?query=${encodeURIComponent(query || '')}&limit=${numLimit}`;
       const res = await fetch(url, { headers: getAuthHeader() });
       if (!res.ok) return [];
       const json = await res.json();
@@ -1393,9 +1756,9 @@ export async function findFiles({ query = '', limit = '20', directory } = {}) {
  * @returns {Promise<Array<{ name: string, status?: string, error?: string }>>}
  */
 export async function getMcpStatus(directory) {
-  if (serveManager.isV2()) {
+  if (engineRegistry.isV2()) {
     try {
-      const url = `${_baseUrl || 'http://localhost:4096'}/api/mcp`;
+      const url = `${getEffectiveBaseUrl()}/api/mcp`;
       const res = await fetch(url, { headers: getAuthHeader() });
       if (!res.ok) return [];
       const json = await res.json();

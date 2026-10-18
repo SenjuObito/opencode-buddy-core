@@ -67,7 +67,7 @@ export function normalizePermissionRequest(props) {
 export function normalizeQuestionRequest(props) {
   const data = (props && typeof props.data === 'object') ? props.data : (props || {});
   const tool = (data.tool && typeof data.tool === 'object')
-    ? (data.tool.callID ?? data.tool.messageID ?? '')
+    ? (data.tool.id ?? data.tool.callID ?? data.tool.messageID ?? '')
     : (props?.tool ?? '');
 
   let questions = [];
