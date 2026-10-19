@@ -230,11 +230,18 @@ export async function createSession(title, directory, selection) {
 
 /**
  * Normalize path for directory comparison (cross-platform, case-insensitive on Windows).
+ *
+ * Case folding is driven by the *shape of the path*, not only by the host OS: a
+ * `C:/...` drive path or a `//server/share` UNC path can only come from a Windows
+ * filesystem, which is case-insensitive there. Records written by a Windows host
+ * (and tests that replay them) must not start matching case-sensitively just
+ * because the check happens to run on Linux — e.g. in CI.
  */
 export function normalizeDirForMatch(p) {
   if (!p || typeof p !== 'string') return '';
   let normalized = p.replace(/\\/g, '/');
-  if (process.platform === 'win32') {
+  const isWindowsPath = /^[a-zA-Z]:\//.test(normalized) || normalized.startsWith('//');
+  if (process.platform === 'win32' || isWindowsPath) {
     normalized = normalized.toLowerCase();
   }
   return normalized.replace(/\/+$/, '');
@@ -1529,20 +1536,21 @@ export async function listMessages(sessionId, directory, options = {}) {
         + `(the route does not exist on this engine build)`,
       );
     }
+    // The body has to be read *here*: the route/`content-type` guard above only
+    // proves the endpoint exists, not that we ever parsed what it returned.
+    let json;
+    try {
+      json = await res.json();
+    } catch (err) {
+      if (options.tolerateError) return [];
+      throw new Error(
+        `Failed to list messages for session ${sessionId}: ${url} returned `
+        + `unparseable JSON (${err?.message || err})`,
+      );
+    }
     let list = Array.isArray(json.items)
       ? json.items
       : (Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []));
-
-    if (list.length === 0) {
-      try {
-        const fallbackRes = await getClient().session.messages({ sessionID: sessionId, ...(directory ? { directory } : {}) });
-        if (Array.isArray(fallbackRes?.data) && fallbackRes.data.length > 0) {
-          list = fallbackRes.data;
-        }
-      } catch (_) {
-        // tolerate fallback error
-      }
-    }
 
     // OpenCode v2 returns messages in reverse chronological order (newest first).
     // Sort ascending by numerical timestamp to guarantee chronological order (oldest first),

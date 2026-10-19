@@ -380,6 +380,32 @@ test('v2 listSessions strictly filters sessions by directory and does not leak o
   }
 });
 
+test('normalizeDirForMatch folds case for Windows-shaped paths on every host', () => {
+  // A drive-letter or UNC path can only come from a Windows filesystem, which is
+  // case-insensitive. The result must not depend on which OS the bridge runs on:
+  // sessions recorded on Windows otherwise stop matching when this code runs on
+  // Linux (CI, containers, WSL-adjacent setups).
+  assert.equal(
+    normalizeDirForMatch('D:\\Source\\Repos\\Project-A\\'),
+    normalizeDirForMatch('d:/source/repos/project-a'),
+  );
+  assert.equal(
+    normalizeDirForMatch('\\\\Server\\Share\\Project'),
+    normalizeDirForMatch('//server/share/project'),
+  );
+});
+
+test('normalizeDirForMatch keeps POSIX paths case-sensitive off Windows', () => {
+  // Trailing slashes are always normalised away.
+  assert.equal(normalizeDirForMatch('/repo/a/'), normalizeDirForMatch('/repo/a'));
+
+  // Windows paths are case-insensitive by definition, so there is nothing to
+  // assert there. Everywhere else `/repo/A` and `/repo/a` are two different
+  // directories, and folding them would merge unrelated projects' sessions.
+  if (process.platform === 'win32') return;
+  assert.notEqual(normalizeDirForMatch('/repo/A'), normalizeDirForMatch('/repo/a'));
+});
+
 test('v2 listMessages preserves compaction message as isCompactSummary', async () => {
   lockV2();
   const stub = stubFetch(() =>
