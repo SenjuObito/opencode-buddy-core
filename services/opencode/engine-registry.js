@@ -286,6 +286,23 @@ export function invalidate(reason = 'unspecified') {
   setState(ENGINE_STATES.PENDING, { kind: 'none', message: '', blocking: false });
 }
 
+/**
+ * Invalidate *and* drop the resolved CLI so the next `ensure()` re-resolves from
+ * the (freshly updated) environment. `invalidate()` alone deliberately keeps
+ * `_cli` to avoid re-scanning, which is exactly wrong after the user changes the
+ * configured opencode path: the old path would be reused forever.
+ *
+ * The caller is responsible for updating `process.env.OPENCODEBUDDY_*` and
+ * stopping the current serve process before relying on the re-resolve.
+ *
+ * @param {string} [reason]
+ */
+export function invalidateForSettingsChange(reason = 'settings-changed') {
+  logInfo('engine-registry', `CLI settings changed (${reason}); dropping cached CLI resolution`);
+  _cli = { path: null, version: null, source: null, verified: false };
+  invalidate(reason);
+}
+
 function fail(kind, message, blocking) {
   _lastFailureAt = Date.now();
   logWarn('engine-registry', `Engine mode undetermined (${kind}): ${message}`);

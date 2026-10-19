@@ -20,9 +20,9 @@ import { homedir } from 'node:os';
 import {
   commonCliBinDirs,
   enrichPathWithBinDirs,
-  isWindowsCmdShim,
   needsShellOnWindows,
-  resolveOpenCodeCliPath,
+  resolveCli,
+  describeResolveFailure,
 } from '../../utils/cli-path.js';
 import { selectWorkingDirectory } from '../../utils/path-utils.js';
 import * as serveManager from './opencode-serve-manager.js';
@@ -249,9 +249,24 @@ export async function listModels() {
   }
 
   // Legacy fallback: `opencode models`
+  // Use the single authoritative resolver so the host-injected user setting
+  // (OPENCODEBUDDY_CLI_PATH, tier L0) is honoured here too — the old
+  // resolveOpenCodeCliPath() only read OPENCODE_BIN/… and silently ignored it.
   let bin;
+  let binNeedsShell;
   try {
-    bin = resolveOpenCodeCliPath();
+    const resolution = resolveCli({ kind: 'opencode', env: process.env });
+    if (!resolution.ok) {
+      console.log(JSON.stringify({
+        success: false,
+        provider: 'opencode',
+        error: describeResolveFailure(resolution),
+        models: [],
+      }));
+      return;
+    }
+    bin = resolution.path;
+    binNeedsShell = resolution.spawn ? resolution.spawn.needsShell : needsShellOnWindows(bin);
   } catch (err) {
     console.log(JSON.stringify({ success: false, error: err?.message || String(err), models: [] }));
     return;
@@ -267,7 +282,7 @@ export async function listModels() {
       timeout: 45_000,
       maxBuffer: 8 * 1024 * 1024,
       // Windows npm `.cmd` shims (and bare names) require a shell to spawn.
-      shell: needsShellOnWindows(bin),
+      shell: binNeedsShell,
     });
   } catch (error) {
     console.log(JSON.stringify({ success: false, error: error?.message || String(error), models: [] }));

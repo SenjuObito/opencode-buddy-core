@@ -420,6 +420,10 @@ function isPortAvailable(port) {
  */
 export async function start(port = 4096, options = {}) {
   _lastPort = port;
+  // An explicit start re-arms steady-state crash recovery: a previous stop()
+  // (e.g. the settings-change invalidate flow) must not permanently disable
+  // auto-restart for the new process.
+  _stopRequested = false;
   if (options.binary) _startOptions.binary = options.binary;
   if (options.cliSource) _startOptions.cliSource = options.cliSource;
   if (options.cliVersion) _startOptions.cliVersion = options.cliVersion;
@@ -736,6 +740,10 @@ function detachChildHandles(child) {
 
 export async function stop() {
   _stopRequested = true;
+  // Drop the resolved binary too: after a settings-change stop the next start
+  // must re-resolve (env has been updated) rather than reuse the old path.
+  _startOptions = { binary: null, cliSource: null, cliVersion: null };
+  _restartAttempts = 0;
   const proc = _process;
   if (!proc) {
     _serverUrl = null;

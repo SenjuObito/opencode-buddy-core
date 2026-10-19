@@ -448,6 +448,35 @@ async function processRequest(request) {
     return;
   }
 
+  // --- Settings change: re-resolve without restarting the daemon ---
+  // This process's environment is frozen at spawn, so the host ships the freshly
+  // resolved user settings in `params.env`; we apply them here, drop the cached
+  // CLI/engine lock, and stop the old serve so the next ensure() re-resolves the
+  // binary and respawns. Handled *before* the engine gate below on purpose: the
+  // gate would re-ensure (and possibly reuse) the very state we are discarding.
+  if (method === 'opencode.invalidate') {
+    const injected = (params && typeof params.env === 'object' && params.env) ? params.env : {};
+    const applied = [];
+    for (const [key, value] of Object.entries(injected)) {
+      if (typeof value === 'string' && value.trim()) {
+        process.env[key] = value;
+        applied.push(key);
+      }
+    }
+    engineRegistry.invalidateForSettingsChange('settings-changed');
+    try {
+      await serveManager.stop();
+    } catch (e) {
+      _originalStderrWrite(`[daemon] opencode.invalidate serve stop failed: ${e.message}\n`, 'utf8');
+    }
+    _originalStderrWrite(
+      `[daemon] opencode.invalidate applied: ${applied.join(', ') || '(no env)'}; serve stopped, will re-resolve\n`,
+      'utf8'
+    );
+    writeRawLine({ id: id || '0', done: true, success: true });
+    return;
+  }
+
   // --- Command execution ---
   if (!id) {
     _originalStderrWrite(
