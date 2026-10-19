@@ -282,6 +282,40 @@ test('invalidate() returns to pending and the next ensure() re-verifies (INV-2, 
   assert.ok(fake.state.calls > 1, 're-locking requires a fresh probe');
 });
 
+test('invalidateForSettingsChange() drops the cached CLI so the next ensure() re-resolves', async () => {
+  const fake = makeFetch({ up: true });
+  let resolveCalls = 0;
+  configure({
+    fetch: fake,
+    overrides: {
+      resolve: () => {
+        resolveCalls += 1;
+        return okResolution;
+      },
+      ensureServer: async () => {
+        fake.state.up = true;
+        return 'http://localhost:4096';
+      },
+    },
+  });
+
+  await registry.ensure();
+  assert.equal(registry.getState(), 'v2');
+
+  // Host changed the configured path: the old server is gone and the env now
+  // carries a different OPENCODEBUDDY_CLI_PATH.
+  fake.state.up = false;
+  registry.invalidateForSettingsChange('settings-changed');
+
+  assert.equal(registry.getState(), 'pending');
+  assert.equal(registry.getStatus().cli.path, null, 'cached CLI must be dropped, unlike invalidate()');
+  assert.equal(registry.getStatus().lastInvalidation, 'settings-changed');
+
+  await registry.ensure();
+  assert.equal(resolveCalls, 1, 'the CLI must be resolved again from the new environment');
+  assert.equal(registry.getStatus().cli.path, okResolution.path);
+});
+
 test('resolveOnly(): resolves the CLI at boot without spawning, and blocks loudly when it cannot', () => {
   configure();
   const status = registry.resolveOnly();
