@@ -380,6 +380,26 @@ test('v2 listSessions strictly filters sessions by directory and does not leak o
   }
 });
 
+test('v2 listSessions forwards parentID so child sessions are discovered server-side', async () => {
+  lockV2();
+  const stub = stubFetch(() =>
+    jsonResponse({
+      data: [
+        { id: 'ses_child', parentID: 'ses_parent', location: { directory: '/repo' }, title: 'Explore repo' },
+      ],
+    }),
+  );
+  try {
+    const children = await listSessions('/repo', 200, 'ses_parent');
+    assert.equal(stub.calls.length, 1);
+    assert.match(stub.calls[0].href, /[?&]parentID=ses_parent(?:&|$)/);
+    assert.equal(children.length, 1);
+    assert.equal(children[0].id, 'ses_child');
+  } finally {
+    stub.restore();
+  }
+});
+
 test('normalizeDirForMatch folds case for Windows-shaped paths on every host', () => {
   // A drive-letter or UNC path can only come from a Windows filesystem, which is
   // case-insensitive. The result must not depend on which OS the bridge runs on:

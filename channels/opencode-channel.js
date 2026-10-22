@@ -96,13 +96,18 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
       break;
 
     case 'listMessages': {
-      const { sessionId, directory } = stdinData || {};
+      const { sessionId, directory, limit } = stdinData || {};
       // 冷启动兜底：历史会话恢复依赖 opencode serve 已就绪。preconnect 在插件
       // 启动时预热 serve，但若 preconnect 失败/过慢，首次 listMessages 会打到
       // 冷 serve 导致 getClient().session.messages 失败/返回空，表现为「首次加载
       // 会话消息列表为空、二次及以后正常」。这里显式等待 serve 就绪再查询。
       await ensureServerReady();
-      const messages = await openCodeListMessages(sessionId || '', directory || undefined);
+      const limitNum = limit ? Number(limit) : 0;
+      const messages = await openCodeListMessages(
+        sessionId || '',
+        directory || undefined,
+        { limit: limitNum > 0 ? limitNum : undefined },
+      );
       // 逐条输出（NDJSON）：此前整包单行 JSON 会被 daemon stdout 拦截器再次
       // stringify（转义膨胀），宿主侧还要 chunks 累积 + join + 全文提取——
       // 长会话恢复时内存峰值放大 5-8 倍。逐条输出每行都是小字符串，宿主
@@ -321,10 +326,10 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
     }
 
     case 'listSessions': {
-      const { directory, limit } = stdinData || {};
+      const { directory, limit, parentID } = stdinData || {};
       await ensureServerReady();
       const limitNum = limit ? Number(limit) : undefined;
-      const sessions = await openCodeListSessions(directory || undefined, limitNum);
+      const sessions = await openCodeListSessions(directory || undefined, limitNum, parentID || undefined);
       console.log(JSON.stringify({
         success: true,
         provider: 'opencode',

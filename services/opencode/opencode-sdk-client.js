@@ -250,12 +250,17 @@ export function normalizeDirForMatch(p) {
 /**
  * @param {string} [directory]
  * @param {number|string} [limit]
+ * @param {string} [parentID] only sessions spawned by this session
  * @returns {Promise<object[]>}
  */
-export async function listSessions(directory, limit) {
+export async function listSessions(directory, limit, parentID) {
   if (engineRegistry.isV2()) {
     const query = new URLSearchParams();
     if (limit && Number(limit) > 0) query.set('limit', String(limit));
+    // opencode v2 exposes child sessions through the same list route; the
+    // parentID filter is server-side, so a long history cannot push a child
+    // past the limit before we see it.
+    if (parentID) query.set('parentID', parentID);
     const qs = query.toString();
     const url = `${getEffectiveBaseUrl()}/api/session${qs ? `?${qs}` : ''}`;
     const res = await fetch(url, {
@@ -299,7 +304,11 @@ export async function listSessions(directory, limit) {
   if (result.error) {
     throw new Error(`Failed to list sessions: ${JSON.stringify(result.error)}`);
   }
-  return result.data ?? [];
+  const sessions = result.data ?? [];
+  if (!parentID) return sessions;
+  // v1 has no parentID query parameter; filter the result instead. It is the
+  // same contract for callers, and keeps the host free of engine branches.
+  return sessions.filter(session => session && session.parentID === parentID);
 }
 
 /**
@@ -1511,7 +1520,8 @@ export async function listMessages(sessionId, directory, options = {}) {
     // `Unexpected token '<'` — a JSON parse error that says nothing about the
     // real problem (a wrong route). Verified against the server's own
     // /openapi.json route table.
-    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/message`;
+    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/message`
+      + (options.limit && Number(options.limit) > 0 ? `?limit=${Number(options.limit)}` : '');
     let res;
     try {
       res = await fetch(url, { headers: getAuthHeader() });
@@ -1634,6 +1644,11 @@ export async function listMessages(sessionId, directory, options = {}) {
         providerID: m.model?.providerID,
         modelID: m.model?.id,
         sessionID: sessionId,
+        // Kept so callers can distinguish a settled turn from a still-running
+        // one without guessing from the message list (subagent history needs
+        // this to stop polling).
+        finish: m.finish,
+        error: m.error,
       };
 
       const parts = [];
@@ -1701,6 +1716,7 @@ export async function listMessages(sessionId, directory, options = {}) {
 
   const params = { sessionID: sessionId };
   if (directory) params.directory = directory;
+  if (options.limit && Number(options.limit) > 0) params.limit = Number(options.limit);
   const result = await getClient().session.messages(params);
   if (result.error) {
     if (options.tolerateError) return [];
