@@ -1289,15 +1289,13 @@ export async function sendMessagePersistent(params = {}) {
   if (!created) {
     await _syncSessionSelection(sessionId, { agent, model, variant });
   }
-  // Bind the identity before emitting anything: every line below (including
-  // `emitSessionId` for a server-normalized id) must be attributable to this
-  // session. A brand-new session's id only exists from here on, which is why
-  // the record is mutated rather than passed in.
+  // Announce the canonical id before binding it. The marker is the host's
+  // bootstrap signal: it must still carry the request id but no session, so the
+  // host can attach the brand-new session to the pending send that created it
+  // (docs/full-refactor-architecture-plan.md §8.2.1). Every later line is
+  // stamped with the session bound below.
+  emitSessionId(sessionId);
   bindSession(sessionId);
-  if (!created && requestedId !== sessionId) {
-    // Caller passed an id we normalized; surface it so the host reuses ours.
-    emitSessionId(sessionId);
-  }
 
   // ── Build file parts for attachments (images + any other file type) ────
   // opencode FilePartInput: { type:'file', mime, filename?, url }
@@ -1383,7 +1381,6 @@ export async function sendMessagePersistent(params = {}) {
 
   // ── Register turn + emit stream-start markers ───────────────────────────
   beginStream(sessionId);
-  emitSessionId(sessionId);
 
   const currentReqId = requestContext.getStore()?.id ?? null;
   const turn = _createTurn(currentReqId, sessionId);
@@ -1507,14 +1504,11 @@ export async function sendShellPersistent(params = {}) {
   if (!created) {
     await _syncSessionSelection(sessionId, { agent, model });
   }
+  emitSessionId(sessionId);
   bindSession(sessionId);
-  if (!created && requestedId !== sessionId) {
-    emitSessionId(sessionId);
-  }
 
   // ── Register turn + emit stream-start markers ───────────────────────────
   beginStream(sessionId);
-  emitSessionId(sessionId);
 
   const currentReqId = requestContext.getStore()?.id ?? null;
   const turn = _createTurn(currentReqId, sessionId);
