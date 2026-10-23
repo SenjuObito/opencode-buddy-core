@@ -9,9 +9,9 @@
  * Windows for `.cmd` shims) and that would need a new rule for every future
  * major. The server itself knows which API it exposes, so we ask it.
  *
- *   GET /api/info  → 200 + JSON  ⇒ v2   (apiVersion, when present, is mapped)
- *   GET  /config   → 200 + JSON  ⇒ v1
- *   anything else                ⇒ unknown  (NEVER "default to v1")
+ *   GET /global/health (or /api/health, /api/info) → 200 + JSON ⇒ v2
+ *   GET /config                                    → 200 + JSON ⇒ v1
+ *   anything else                                  ⇒ unknown  (NEVER "default to v1")
  *
  * Note on the HTML SPA fallback: an unknown route returns 200 with
  * `text/html` from the web UI. Treating "any 200" as success is exactly what
@@ -19,6 +19,9 @@
  * "Request is not supported by this version of OpenCode Server" error, so a
  * JSON content type is required here.
  */
+
+/** Candidate routes for probing OpenCode v2 capabilities (ordered by priority). */
+export const V2_PROBE_PATHS = ['/global/health', '/api/health', '/api/info'];
 
 /** Server-reported API version → engine mode. Add `3: 'v3'` when v3 lands. */
 export const ENGINE_BY_API_VERSION = {
@@ -159,58 +162,85 @@ export async function probeEngine(opts = {}) {
   const authHeaders = buildHeaders({ password, directory });
   const anonHeaders = buildHeaders({ password: null, directory });
 
-  // ── v2: /api/info ────────────────────────────────────────────────────────
-  // Authenticated first, then anonymous: a v2 server that has *no* password
-  // configured may still reject a request carrying a wrong Basic header, and a
-  // v2 server that *does* require auth rejects anonymous ones. Trying both
-  // avoids turning "password unknown to this process" into "engine unknown".
+  // ── v2 probe ─────────────────────────────────────────────────────────────
+  // OpenCode 1.19+ official endpoint is /global/health (returning { healthy: true, version: ... }).
+  // We also check /api/health and /api/info for backward compatibility with mocks and older setups.
   const infoAttempts = password
     ? [authHeaders, anonHeaders]
     : [anonHeaders];
-  let info = { status: null, contentType: null, text: '', error: null };
-  for (const headers of infoAttempts) {
-    info = await runWithRetry('/api/info', headers);
-    const parsed = info.status === 200 && isJsonContentType(info.contentType)
-      ? parseJson(info.text)
-      : null;
-    if (parsed) {
-      const reported = Number(parsed.apiVersion);
-      const apiVersion = Number.isFinite(reported) ? reported : 2;
-      const engine = ENGINE_BY_API_VERSION[apiVersion] || 'unknown';
-      if (engine !== 'unknown') {
+
+  let decisive = null;
+
+  for (const v2Path of V2_PROBE_PATHS) {
+    let matchedInPath = false;
+    for (const headers of infoAttempts) {
+      const info = await runWithRetry(v2Path, headers);
+      if (info.status !== null) {
+        decisive = { ...info, probePath: v2Path };
+      }
+      const parsed = info.status === 200 && isJsonContentType(info.contentType)
+        ? parseJson(info.text)
+        : null;
+      if (parsed) {
+        matchedInPath = true;
+        const reported = Number(parsed.apiVersion);
+        let apiVersion = null;
+        if (Number.isFinite(reported)) {
+          apiVersion = reported;
+        } else if (typeof parsed.version === 'string' && parsed.version.trim()) {
+          // 严格按版本号（1.x 为 v1，2.0+ 为 v2）判定
+          const match = parsed.version.trim().match(/^v?(\d+)/i);
+          if (match) {
+            const major = parseInt(match[1], 10);
+            apiVersion = major === 1 ? 1 : (major >= 2 ? 2 : null);
+          }
+        }
+
+        if (apiVersion === null) {
+          apiVersion = v2Path.startsWith('/api/') ? 2 : 1;
+        }
+
+        const engine = ENGINE_BY_API_VERSION[apiVersion] || 'unknown';
+        if (engine !== 'unknown') {
+          return {
+            engine,
+            apiVersion,
+            tries,
+            evidence: {
+              probePath: v2Path,
+              status: info.status,
+              contentType: info.contentType,
+              apiVersion,
+              observedAt: Date.now(),
+              error: null,
+            },
+          };
+        }
+        // Server reported an API version we do not know yet: report unknown rather
+        // than guessing (this is the v3 forward-compat hole, surfaced explicitly).
         return {
-          engine,
+          engine: 'unknown',
           apiVersion,
           tries,
           evidence: {
-            probePath: '/api/info',
+            probePath: v2Path,
             status: info.status,
             contentType: info.contentType,
             apiVersion,
             observedAt: Date.now(),
-            error: null,
+            error: 'unsupported-api-version',
           },
         };
       }
-      // Server reported an API version we do not know yet: report unknown rather
-      // than guessing (this is the v3 forward-compat hole, surfaced explicitly).
-      return {
-        engine: 'unknown',
-        apiVersion,
-        tries,
-        evidence: {
-          probePath: '/api/info',
-          status: info.status,
-          contentType: info.contentType,
-          apiVersion,
-          observedAt: Date.now(),
-          error: 'unsupported-api-version',
-        },
-      };
+      // 401/403 with credentials is worth retrying anonymously; any other outcome
+      // (404 SPA fallback, HTML, 5xx) will not change with a different header.
+      if (!(info.status === 401 || info.status === 403)) break;
     }
-    // 401/403 with credentials is worth retrying anonymously; any other outcome
-    // (404 SPA fallback, HTML, 5xx) will not change with a different header.
-    if (!(info.status === 401 || info.status === 403)) break;
+    // If this route matched, we would have returned above.
+    // If it returned 401/403 even after anon retry, server requires valid auth on v2 route.
+    if (decisive && (decisive.status === 401 || decisive.status === 403)) {
+      break;
+    }
   }
 
   // ── v1: /config ──────────────────────────────────────────────────────────
@@ -219,6 +249,9 @@ export async function probeEngine(opts = {}) {
   let config = await runWithRetry('/config', anonHeaders);
   if (config.status === 401 || config.status === 403) {
     config = await runWithRetry('/config', authHeaders);
+  }
+  if (config.status !== null) {
+    decisive = { ...config, probePath: '/config' };
   }
 
   if (config.status === 200 && isJsonContentType(config.contentType) && parseJson(config.text)) {
@@ -237,20 +270,19 @@ export async function probeEngine(opts = {}) {
     };
   }
 
-  // Neither capability matched. `/api/info` may have answered with the HTML SPA
-  // fallback, or nothing answered at all.
-  const decisive = info.status !== null ? info : config;
+  // Neither capability matched.
+  const lastDecisive = decisive || { status: null, contentType: null, probePath: null };
   return {
     engine: 'unknown',
     apiVersion: null,
     tries,
     evidence: {
-      probePath: decisive.status !== null ? '/api/info' : null,
-      status: decisive.status,
-      contentType: decisive.contentType,
+      probePath: lastDecisive.probePath || null,
+      status: lastDecisive.status,
+      contentType: lastDecisive.contentType,
       apiVersion: null,
       observedAt: Date.now(),
-      error: decisive.status === null ? (lastError || 'no-response') : 'no-capability-match',
+      error: lastDecisive.status === null ? (lastError || 'no-response') : 'no-capability-match',
     },
   };
 }
@@ -266,7 +298,7 @@ export function describeProbeFailure(result) {
     return `Server reports unknown API version ${ev.apiVersion} — this plugin supports v1/v2 only`;
   }
   if (ev.error === 'no-capability-match') {
-    return `Server on the configured port answered HTTP ${ev.status} (${ev.contentType || 'no content-type'}) but exposed neither /api/info (v2) nor /config (v1). Another process may be listening on this port.`;
+    return `Server on the configured port answered HTTP ${ev.status} (${ev.contentType || 'no content-type'}) but exposed neither /global/health (v2) nor /config (v1). Another process may be listening on this port.`;
   }
   if (ev.status === null) {
     return `No HTTP response from the opencode server (${ev.error || 'unknown error'})`;

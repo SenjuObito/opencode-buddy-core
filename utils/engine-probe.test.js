@@ -22,6 +22,28 @@ function fakeFetch(routes, calls = []) {
   };
 }
 
+test('probeEngine: /global/health with version 1.19.1 ⇒ v1', async () => {
+  const res = await probeEngine({
+    baseUrl: 'http://localhost:4096',
+    fetchImpl: fakeFetch({ '/global/health': response(200, { healthy: true, version: '1.19.1' }) }),
+  });
+  assert.equal(res.engine, 'v1');
+  assert.equal(res.apiVersion, 1);
+  assert.equal(res.evidence.probePath, '/global/health');
+  assert.equal(res.evidence.status, 200);
+});
+
+test('probeEngine: /global/health with version 2.0.0 ⇒ v2', async () => {
+  const res = await probeEngine({
+    baseUrl: 'http://localhost:4096',
+    fetchImpl: fakeFetch({ '/global/health': response(200, { healthy: true, version: '2.0.0' }) }),
+  });
+  assert.equal(res.engine, 'v2');
+  assert.equal(res.apiVersion, 2);
+  assert.equal(res.evidence.probePath, '/global/health');
+  assert.equal(res.evidence.status, 200);
+});
+
 test('probeEngine: /api/info with apiVersion 2 ⇒ v2', async () => {
   const res = await probeEngine({
     baseUrl: 'http://localhost:4096',
@@ -76,7 +98,7 @@ test('probeEngine: 401 with a password retries anonymously (password mismatch �
     baseUrl: 'http://localhost:4096',
     password: 'stale-password',
     fetchImpl: fakeFetch({
-      '/api/info': (init) => (
+      '/global/health': (init) => (
         init?.headers?.Authorization
           ? response(401, { error: 'unauthorized' })
           : response(200, { apiVersion: 2 })
