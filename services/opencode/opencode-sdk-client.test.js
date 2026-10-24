@@ -400,6 +400,32 @@ test('v2 listSessions forwards parentID so child sessions are discovered server-
   }
 });
 
+test('v2 listSessions unifies location.directory and the model object for the host', async () => {
+  lockV2();
+  const stub = stubFetch(() =>
+    jsonResponse({
+      data: [
+        {
+          id: 'ses_1',
+          location: { directory: 'd:/source/repos/project-a' },
+          model: { providerID: 'opencode', id: 'deepseek-v4.1-flash-free', variant: 'low' },
+          agent: 'build',
+          title: 'Project A session',
+        },
+      ],
+    }),
+  );
+  try {
+    const sessions = await listSessions('D:\\source\\repos\\project-a');
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0].directory, 'd:/source/repos/project-a');
+    assert.equal(sessions[0].model, 'opencode/deepseek-v4.1-flash-free');
+    assert.equal(sessions[0].agent, 'build');
+  } finally {
+    stub.restore();
+  }
+});
+
 test('normalizeDirForMatch folds case for Windows-shaped paths on every host', () => {
   // A drive-letter or UNC path can only come from a Windows filesystem, which is
   // case-insensitive. The result must not depend on which OS the bridge runs on:

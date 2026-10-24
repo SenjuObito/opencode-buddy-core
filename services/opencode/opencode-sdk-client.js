@@ -248,6 +248,34 @@ export function normalizeDirForMatch(p) {
 }
 
 /**
+ * Normalize a session summary so v1 and v2 consumers see the same fields.
+ *
+ * v2 exposes a nested `location.directory` and a `{providerID,id}` model
+ * object; v1 exposes `directory` and (when present) a primitive model. The
+ * host history layer should not have to unpack either shape.
+ *
+ * @param {object} session
+ * @returns {object}
+ */
+function normalizeSessionSummary(session) {
+  if (!session || typeof session !== 'object') return session;
+  const directory = session.location?.directory || session.directory || '';
+  let model = session.model;
+  if (model && typeof model === 'object') {
+    const providerID = typeof model.providerID === 'string' ? model.providerID : '';
+    const id = typeof model.id === 'string' ? model.id : (typeof model.modelID === 'string' ? model.modelID : '');
+    model = providerID && id ? `${providerID}/${id}` : (id || providerID || undefined);
+  }
+  const normalized = { ...session, directory };
+  if (typeof model === 'string' && model) {
+    normalized.model = model;
+  } else {
+    delete normalized.model;
+  }
+  return normalized;
+}
+
+/**
  * @param {string} [directory]
  * @param {number|string} [limit]
  * @param {string} [parentID] only sessions spawned by this session
@@ -274,15 +302,8 @@ export async function listSessions(directory, limit, parentID) {
       ? json.items
       : (Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []));
 
-    // Align v2 session objects with unified directory property
-    const unifiedList = rawList.map(s => {
-      if (!s || typeof s !== 'object') return s;
-      const dir = s.location?.directory || s.directory;
-      return {
-        ...s,
-        directory: dir || '',
-      };
-    });
+    // Align v1/v2 session objects with the unified host shape.
+    const unifiedList = rawList.map(normalizeSessionSummary);
 
     // Robust directory filtering for Windows (case-insensitive & slash-normalized)
     if (directory && typeof directory === 'string' && directory.trim()) {
@@ -304,7 +325,7 @@ export async function listSessions(directory, limit, parentID) {
   if (result.error) {
     throw new Error(`Failed to list sessions: ${JSON.stringify(result.error)}`);
   }
-  const sessions = result.data ?? [];
+  const sessions = (result.data ?? []).map(normalizeSessionSummary);
   if (!parentID) return sessions;
   // v1 has no parentID query parameter; filter the result instead. It is the
   // same contract for callers, and keeps the host free of engine branches.
@@ -1511,6 +1532,117 @@ function summarizeError(error) {
  *   回合结束时的最终消息抓取、上下文用量估算）。
  * @returns {Promise<object[]>} message entries `{ info, parts }`
  */
+function numberOrNull(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function booleanOrNull(value) {
+  return typeof value === 'boolean' ? value : null;
+}
+
+/**
+ * Normalize the provider error shapes emitted by v1 and v2 into one contract.
+ *
+ * v1: { name: 'APIError', data: { message, statusCode, isRetryable } }
+ * v2: { type: 'provider.quota', message, status, ... }
+ *
+ * The host must never have to know which engine produced the message.
+ *
+ * @param {unknown} error
+ * @param {string} [finish]
+ * @returns {{ kind: string, message: string, status: number|null, retryable: boolean|null }|null}
+ */
+export function normalizeProviderError(error, finish) {
+  if (error == null) {
+    return finish === 'error'
+      ? { kind: 'unknown', message: 'Request ended with error', status: null, retryable: null }
+      : null;
+  }
+  if (typeof error === 'string') {
+    return { kind: 'unknown', message: error, status: null, retryable: null };
+  }
+  if (typeof error !== 'object') {
+    return { kind: 'unknown', message: String(error), status: null, retryable: null };
+  }
+
+  const type = typeof error.type === 'string' ? error.type : '';
+  const name = typeof error.name === 'string' ? error.name : '';
+  const kind = typeof error.kind === 'string' ? error.kind : '';
+  const message = typeof error.message === 'string' ? error.message : '';
+  if (message) {
+    return {
+      kind: type || name || kind || 'unknown',
+      message,
+      status: numberOrNull(error.status ?? error.statusCode),
+      retryable: booleanOrNull(error.retryable ?? error.isRetryable),
+    };
+  }
+
+  const data = error.data && typeof error.data === 'object' ? error.data : null;
+  if (data) {
+    const nestedMessage = typeof data.message === 'string' ? data.message
+      : typeof data.type === 'string' ? data.type
+      : '';
+    if (nestedMessage) {
+      return {
+        kind: type || name || 'unknown',
+        message: nestedMessage,
+        status: numberOrNull(data.statusCode ?? data.status),
+        retryable: booleanOrNull(data.isRetryable ?? data.retryable),
+      };
+    }
+  }
+
+  return {
+    kind: type || name || 'unknown',
+    message: name || type || 'Request ended with error',
+    status: null,
+    retryable: null,
+  };
+}
+
+/**
+ * Normalize one engine message entry into the host contract:
+ * `{ info, parts }` with a flat, version-independent `info.error`.
+ *
+ * v1 returns `{ info, parts }` and may put the error under
+ * `info.error.data.message`; v2 returns flattened messages and puts it under
+ * `error.message`. Both are reduced here. A terminal error that produced no
+ * text part also gets a synthetic error part so the host transcript always has
+ * something to render.
+ *
+ * @param {{ info?: object, parts?: object[], error?: unknown, finish?: string }} entry
+ * @param {string} sessionId
+ * @returns {{ info: object, parts: object[] }}
+ */
+export function normalizeMessageEntry(entry, sessionId) {
+  const source = entry && typeof entry === 'object' ? entry : {};
+  const info = source.info && typeof source.info === 'object' ? { ...source.info } : {};
+  const parts = Array.isArray(source.parts) ? [...source.parts] : [];
+
+  if (!info.sessionID) info.sessionID = sessionId;
+  if (info.error == null && source.error != null) info.error = source.error;
+  if (info.finish == null && source.finish != null) info.finish = source.finish;
+
+  const error = normalizeProviderError(info.error, info.finish);
+  if (error) {
+    info.error = error;
+    if (info.finish == null) info.finish = 'error';
+    const aborted = error.kind === 'MessageAbortedError'
+      || error.kind === 'aborted'
+      || /interrupt|abort/i.test(error.message || '')
+      || info.finish === 'interrupted';
+    if (aborted) info.aborted = true;
+    if (info.role === 'assistant' && !parts.some((part) => part && part.type === 'text')) {
+      parts.push(aborted
+        ? { type: 'text', text: ABORTED_NOTICE, aborted: true }
+        : { type: 'text', text: `[Error: ${error.message}]`, isError: true });
+    }
+  }
+
+  return { info, parts };
+}
+
 export async function listMessages(sessionId, directory, options = {}) {
   if (engineRegistry.isV2()) {
     // OpenCode REST API routing:
@@ -1599,13 +1731,13 @@ export async function listMessages(sessionId, directory, options = {}) {
             };
           }
         }
-        entries.push({
+        entries.push(normalizeMessageEntry({
           info: {
             ...m.info,
             sessionID: m.info.sessionID || sessionId,
           },
           parts: m.parts,
-        });
+        }, sessionId));
         continue;
       }
 
@@ -1628,7 +1760,7 @@ export async function listMessages(sessionId, directory, options = {}) {
           sessionID: sessionId,
         };
         const parts = [{ type: 'text', text: summaryText }];
-        entries.push({ info, parts });
+        entries.push(normalizeMessageEntry({ info, parts }, sessionId));
         continue;
       }
 
@@ -1691,25 +1823,8 @@ export async function listMessages(sessionId, directory, options = {}) {
             }
           }
         }
-        if (m.error || m.finish === 'error') {
-          const errType = (m.error && typeof m.error === 'object') ? m.error.type : '';
-          const errText = m.error?.message
-            || (typeof m.error === 'string' ? m.error
-              : (m.finish === 'error' ? 'Request ended with error' : ''));
-          // A user-initiated stop is an *outcome*, not a fault. v1 never reached
-          // this branch (it returns the SDK payload untouched), so this shaping
-          const aborted = errType === 'aborted' || /interrupt|abort/i.test(errText || '') || m.finish === 'interrupted';
-          if (errText && !parts.some(p => p.type === 'text')) {
-            if (aborted) {
-              info.aborted = true;
-            }
-            parts.push(aborted
-              ? { type: 'text', text: ABORTED_NOTICE, aborted: true }
-              : { type: 'text', text: `[Error: ${errText}]`, isError: true });
-          }
-        }
       }
-      entries.push({ info, parts });
+      entries.push(normalizeMessageEntry({ info, parts }, sessionId));
     }
     return entries;
   }
@@ -1722,7 +1837,8 @@ export async function listMessages(sessionId, directory, options = {}) {
     if (options.tolerateError) return [];
     throw new Error(`Failed to list messages for session ${sessionId}: ${summarizeError(result.error)}`);
   }
-  return result.data ?? [];
+  const entries = Array.isArray(result.data) ? result.data : [];
+  return entries.map((entry) => normalizeMessageEntry(entry, sessionId));
 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────

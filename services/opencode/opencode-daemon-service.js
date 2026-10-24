@@ -757,6 +757,21 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     case 'session.execution.succeeded':
       if (turn) _settleTurn(turn, { success: true });
       break;
+    case 'session.step.failed':
+    case 'session.next.step.failed': {
+      // v2 reports the provider failure here before the terminal idle/end
+      // event. Normalize it once so the host can show the real reason
+      // immediately even if the later listMessages snapshot is delayed or lost.
+      const raw = props?.error || props?.data?.error || { message: type };
+      const normalized = sdk.normalizeProviderError(raw, 'error');
+      if (normalized) {
+        emitJsonStringMarker('[TURN_ERROR]', {
+          sessionID: sessionID || '',
+          ...normalized,
+        });
+      }
+      break;
+    }
     case 'session.compacted':
     case 'session.compaction.ended':
     case 'session.next.compaction.ended':
