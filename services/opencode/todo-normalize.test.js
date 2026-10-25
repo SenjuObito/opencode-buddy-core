@@ -140,6 +140,38 @@ test('v1 message.part.updated todowrite publishes canonical todos', () => {
   assert.equal(markers[0].todos[1].status, 'pending');
 });
 
+test('v2 session.tool.input todowrite publishes canonical todos', () => {
+  _resetTodosForTest();
+  const turn = _createTurn(null, 'ses_v2');
+  _activeTurns.set('ses_v2', turn);
+  try {
+    const markers = collectTodoMarkers(() => {
+      _handleEvent({
+        type: 'session.tool.input',
+        properties: {
+          sessionID: 'ses_v2',
+          callID: 'call_v2',
+          name: 'todowrite',
+          input: {
+            todos: [
+              { content: 'v2 first', status: 'in_progress' },
+              { content: 'v2 cancelled', status: 'cancelled' },
+            ],
+          },
+        },
+      });
+    });
+
+    assert.equal(markers.length, 1);
+    assert.equal(markers[0].sessionID, 'ses_v2');
+    assert.equal(markers[0].source, 'session.tool.input');
+    assert.equal(markers[0].todos[0].status, 'in_progress');
+    assert.equal(markers[0].todos[1].status, 'cancelled');
+  } finally {
+    _activeTurns.delete('ses_v2');
+  }
+});
+
 test('v1 todo.updated event uses the canonical normalizer', () => {
   _resetTodosForTest();
   const markers = collectTodoMarkers(() => {
