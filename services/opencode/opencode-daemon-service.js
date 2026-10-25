@@ -87,6 +87,17 @@ const _sseSubPromises = new Map();
 const _activeTurns = new Map();
 /** @type {Map<string, { directory?: string }>} sessionID → session state */
 const _sessions = new Map();
+/**
+ * Canonical todo state per session.
+ *
+ * v1 publishes `todo.updated`; v2 has no todo event and only the
+ * `todowrite` tool call. Both are normalized here so the host and webview
+ * never have to branch on the engine or guess when a turn ends.
+ *
+ * @type {Map<string, { revision: number, signature: string, todos: object[] }>}
+ */
+const _sessionTodos = new Map();
+let _todoRevision = 0;
 
 // ── Test seams ──────────────────────────────────────────────────────────────
 // `_handleEvent`, `_activeTurns`, `_createTurn`, `_settleTurn` and
@@ -502,6 +513,96 @@ function maybeEmitQuestionPrompt(turn, sessionID, callID, name, input) {
   emitJsonStringMarker('[QUESTION_REQUEST]', request);
 }
 
+// ── canonical todos ─────────────────────────────────────────────────────────
+
+function normalizeTodoStatus(value) {
+  const status = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (status === 'completed' || status === 'done') return 'completed';
+  if (status === 'in_progress' || status === 'in-progress' || status === 'active' || status === 'running') {
+    return 'in_progress';
+  }
+  if (status === 'cancelled' || status === 'canceled') return 'cancelled';
+  return 'pending';
+}
+
+function normalizeTodoItem(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+  const candidates = [item.content, item.step, item.title, item.text, item.subject, item.description];
+  const content = candidates.find((value) => typeof value === 'string' && value.trim());
+  if (!content) return null;
+  const normalized = {
+    content: content.trim(),
+    status: normalizeTodoStatus(item.status),
+  };
+  if (item.id !== undefined && item.id !== null) {
+    normalized.id = String(item.id);
+  }
+  if (Array.isArray(item.blockedBy)) {
+    normalized.blockedBy = item.blockedBy
+      .map((id) => (id === undefined || id === null ? null : String(id)))
+      .filter((id) => id !== null);
+  }
+  return normalized;
+}
+
+/**
+ * Normalize a v1 `todo.updated` payload or a v2 `todowrite` input list.
+ * Status is always one of pending/in_progress/completed/cancelled; the host
+ * must not reinterpret `in_progress` as completed at turn end.
+ */
+export function normalizeTodoList(rawTodos) {
+  if (!Array.isArray(rawTodos)) return null;
+  return rawTodos.map(normalizeTodoItem).filter((item) => item !== null);
+}
+
+/**
+ * Publish the latest canonical todo list for one session.
+ *
+ * Emits only on a real change. The first event establishes the list; an empty
+ * array is meaningful and clears it. `revision` lets a client discard an older
+ * snapshot that arrives after a newer one.
+ *
+ * @param {string} sessionID
+ * @param {unknown} rawTodos
+ * @param {string} source - event/tool name for diagnostics
+ */
+export function _emitTodos(sessionID, rawTodos, source = 'unknown') {
+  if (!sessionID || typeof sessionID !== 'string') return;
+  const todos = normalizeTodoList(rawTodos);
+  if (todos === null) return;
+
+  const signature = JSON.stringify(todos);
+  const previous = _sessionTodos.get(sessionID);
+  if (previous && previous.signature === signature) return;
+
+  const revision = ++_todoRevision;
+  _sessionTodos.set(sessionID, { revision, signature, todos });
+  while (_sessionTodos.size > MAX_TRACKED_SESSIONS) {
+    const oldest = _sessionTodos.keys().next().value;
+    if (oldest === undefined) break;
+    _sessionTodos.delete(oldest);
+  }
+  logDebug('todo updated:', sessionID, 'source:', source, 'count:', todos.length,
+    'revision:', revision);
+  emitJsonStringMarker('[TODO_UPDATED]', JSON.stringify({
+    sessionID,
+    revision,
+    source,
+    todos,
+  }));
+}
+
+/** Read the current canonical list (used by tests and future history APIs). */
+export function getSessionTodos(sessionID) {
+  return _sessionTodos.get(sessionID)?.todos ?? null;
+}
+
+/** Test seam: drop canonical todo state between isolated cases. */
+export function _resetTodosForTest() {
+  _sessionTodos.clear();
+  _todoRevision = 0;
+}
+
 /**
  * One-shot diagnostic for events this build does not handle.
  *
@@ -673,6 +774,10 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
             turn.toolUseInput.set(callID, inputJson);
             turn.toolUseDone.add(callID);
             emitToolUseMessage({ id: callID, name, input });
+          }
+          const todoTool = name.toLowerCase();
+          if ((todoTool === 'todowrite' || todoTool === 'todo') && Array.isArray(input.todos)) {
+            _emitTodos(sessionID || turn.sessionId, input.todos, type);
           }
           maybeEmitQuestionPrompt(turn, sessionID, callID, name, input);
         }
@@ -881,11 +986,8 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       break;
     }
     case 'todo.updated': {
-      const todos = props?.todos;
-      if (Array.isArray(todos)) {
-        logDebug('todo.updated: session:', sessionID, 'count:', todos.length);
-        emitJsonStringMarker('[TODO_UPDATED]', JSON.stringify({ sessionID, todos }));
-      }
+      const todos = props?.todos ?? props?.data?.todos;
+      _emitTodos(sessionID || props?.sessionID || props?.data?.sessionID, todos, type);
       break;
     }
     default:
@@ -960,6 +1062,10 @@ export function _handleToolPart(part, turn) {
   // 所以补发不会产生重复的工具卡片。
   const rawInput = state.input;
   const input = (rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput)) ? rawInput : {};
+  const todoTool = name.toLowerCase();
+  if ((todoTool === 'todowrite' || todoTool === 'todo') && Array.isArray(input.todos)) {
+    _emitTodos(turn?.sessionId, input.todos, 'message.part.updated');
+  }
   const inputJson = JSON.stringify(input);
   const emittedJson = turn.toolUseInput.get(callID);
   const inputReady = Object.keys(input).length > 0;
