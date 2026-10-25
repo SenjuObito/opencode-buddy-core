@@ -5,6 +5,7 @@
 import { sendMessage as openCodeSendMessage } from '../services/opencode/message-service.js';
 import { listModels as openCodeListModels, ensureServerReady } from '../services/opencode/models-service.js';
 import { getSessionDirectory } from '../services/opencode/opencode-daemon-service.js';
+import { getSubagentHistory as openCodeGetSubagentHistory } from '../services/opencode/subagent-service.js';
 import * as engineRegistry from '../services/opencode/engine-registry.js';
 import {
   replyPermission as openCodeReplyPermission,
@@ -134,6 +135,25 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
         sessionId: sessionId || '',
         messagesDone: true,
         count: entries.length,
+      }));
+      break;
+    }
+
+    case 'getSubagentHistory': {
+      const { sessionId, toolUseId, description, directory, poll } = stdinData || {};
+      await ensureServerReady();
+      const history = await openCodeGetSubagentHistory({
+        parentSessionId: sessionId || '',
+        toolUseId: toolUseId || '',
+        description: description || '',
+        directory: directory || undefined,
+        poll: poll === true,
+      });
+      console.log(JSON.stringify({
+        success: true,
+        provider: 'opencode',
+        sessionId: sessionId || '',
+        history: history ?? null,
       }));
       break;
     }
@@ -369,7 +389,7 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
 
 export function getOpenCodeCommandList() {
   return [
-    'send', 'listModels', 'listMessages', 'getSessionInfo', 'listAgents', 'listCommands',
+    'send', 'listModels', 'listMessages', 'getSubagentHistory', 'getSessionInfo', 'listAgents', 'listCommands',
     'listMcpServers', 'getMcpStatus', 'replyPermission', 'replyQuestion', 'rejectQuestion',
     'shareSession', 'unshareSession', 'revert', 'unrevert', 'fork', 'summarize',
     'findFiles', 'listSessions', 'deleteSession', 'updateSessionTitle', 'toggleFavorite',
