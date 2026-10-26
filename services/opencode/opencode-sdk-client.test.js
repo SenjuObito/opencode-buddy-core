@@ -11,8 +11,10 @@ import {
   setBaseUrl,
   setSessionAgent,
   setSessionModel,
+  shareSession,
   summarizeSession,
   toV2ModelRef,
+  unshareSession,
 } from './opencode-sdk-client.js';
 import { resolvePendingCompaction, clearPendingCompactions } from './compaction-tracker.js';
 
@@ -481,8 +483,84 @@ test('v2 listMessages preserves compaction message as isCompactSummary', async (
     assert.equal(compactEntry.info.role, 'compaction');
     assert.equal(compactEntry.info.isCompactSummary, true);
     assert.equal(compactEntry.info.compactMetadata?.trigger, 'manual');
-    assert.equal(compactEntry.info.compactMetadata?.userContext, 'The session was compacted.');
+    assert.equal(compactEntry.info.compactMetadata?.userContext, undefined);
     assert.equal(compactEntry.parts[0]?.text, 'The session was compacted.');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v2 shareSession posts to /api/session/{id}/share', async () => {
+  lockV2();
+  const stub = stubFetch(() => jsonResponse({ id: SESSION_ID, share: { url: 'https://opencode.ai/s/x' } }));
+  try {
+    const share = await shareSession(SESSION_ID, '/repo');
+    assert.equal(stub.calls.length, 1);
+    assert.equal(stub.calls[0].path, `/api/session/${SESSION_ID}/share`);
+    assert.equal(stub.calls[0].init.method, 'POST');
+    assert.equal(stub.calls[0].init.headers['x-opencode-directory'], encodeURIComponent('/repo'));
+    assert.equal(share.share.url, 'https://opencode.ai/s/x');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v2 shareSession falls back to the unprefixed route on 404', async () => {
+  lockV2();
+  const stub = stubFetch((href) =>
+    href.includes('/api/session/')
+      ? jsonResponse({ error: 'not found' }, 404)
+      : jsonResponse({ share: { url: 'https://opencode.ai/s/y' } }),
+  );
+  try {
+    const share = await shareSession(SESSION_ID);
+    assert.equal(stub.calls.length, 2);
+    assert.equal(stub.calls[1].path, `/session/${SESSION_ID}/share`);
+    assert.equal(share.share.url, 'https://opencode.ai/s/y');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v2 unshareSession deletes /api/session/{id}/share', async () => {
+  lockV2();
+  const stub = stubFetch(() => jsonResponse({ id: SESSION_ID }));
+  try {
+    await unshareSession(SESSION_ID);
+    assert.equal(stub.calls.length, 1);
+    assert.equal(stub.calls[0].path, `/api/session/${SESSION_ID}/share`);
+    assert.equal(stub.calls[0].init.method, 'DELETE');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v2 listMessages puts an untimed compaction record at the end', async () => {  lockV2();
+  const stub = stubFetch(() =>
+    jsonResponse({
+      data: [
+        {
+          type: 'compaction',
+          reason: 'manual',
+          summary: '## Objective\nThe session was compacted.',
+          metadata: { keepID: 'msg_keep' },
+        },
+        {
+          type: 'user',
+          id: 'usr_1',
+          text: 'Hello again',
+          time: { created: 2000 },
+        },
+      ],
+    }),
+  );
+  try {
+    const messages = await listMessages(SESSION_ID);
+    assert.equal(messages.length, 2);
+    assert.equal(messages[0].info.role, 'user');
+    assert.equal(messages[1].info.role, 'compaction');
+    assert.equal(messages[1].info.compactMetadata?.trigger, 'manual');
+    assert.equal(messages[1].info.compactMetadata?.userContext, undefined);
   } finally {
     stub.restore();
   }

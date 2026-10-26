@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 
 import {
   childFromList,
+  collectSubagentCalls,
   convertEntries,
   findTool,
   getSubagentHistory,
+  listSubagentStatuses,
   statusFromEntries,
 } from './subagent-service.js';
 
@@ -175,4 +177,82 @@ test('getSubagentHistory reports a fetch failure as running, not completed', asy
   assert.equal(history.status, 'running');
   assert.equal(history.completed, false);
   assert.match(history.error, /bridge down/);
+});
+
+
+test('collectSubagentCalls keeps background launches across both engines', () => {
+  const entries = [{
+    info: { role: 'assistant' },
+    parts: [
+      { type: 'tool', id: 'call_v1', tool: 'task', state: { input: { run_in_background: true, description: 'v1 job' } } },
+      { type: 'tool', id: 'call_v2', tool: 'subagent', state: { input: { background: true, description: 'v2 job' }, metadata: { sessionID: 'ses_v2' } } },
+      { type: 'tool', id: 'call_sync', tool: 'subagent', state: { input: { description: 'sync job' } } },
+      { type: 'tool', id: 'call_bash', tool: 'bash', state: { input: { background: true } } },
+    ],
+  }];
+
+  const calls = collectSubagentCalls(entries);
+  assert.deepEqual(calls.map((call) => call.toolUseId), ['call_v2', 'call_v1']);
+  assert.equal(calls[0].childSessionId, 'ses_v2');
+  assert.equal(calls[0].description, 'v2 job');
+  assert.equal(calls[1].childSessionId, null);
+});
+
+test('collectSubagentCalls reads the child from the launch acknowledgement text', () => {
+  const entries = [{
+    info: { role: 'assistant' },
+    parts: [{
+      type: 'tool',
+      id: 'call_v2',
+      tool: 'subagent',
+      state: {
+        input: { background: true, description: 'job' },
+        output: '{"sessionID":"ses_ack","status":"running","output":["working"]}',
+      },
+    }],
+  }];
+  assert.equal(collectSubagentCalls(entries)[0].childSessionId, 'ses_ack');
+});
+
+test('listSubagentStatuses resolves every background call once per load', async () => {
+  const reads = [];
+  const deps = {
+    listMessages: async (sessionID) => {
+      reads.push(sessionID);
+      if (sessionID === 'ses_parent') {
+        return [{
+          info: { role: 'assistant' },
+          parts: [
+            { type: 'tool', id: 'call_done', tool: 'subagent', state: { input: { background: true, description: 'a' }, metadata: { sessionID: 'ses_child_done' } } },
+            { type: 'tool', id: 'call_run', tool: 'subagent', state: { input: { background: true, description: 'b' }, metadata: { sessionID: 'ses_child_run' } } },
+          ],
+        }];
+      }
+      if (sessionID === 'ses_child_done') return [entry('assistant', 'stop')];
+      return [entry('assistant', 'tool-calls')];
+    },
+    listSessions: async () => [],
+  };
+
+  const result = await listSubagentStatuses({ parentSessionId: 'ses_parent' }, deps);
+  assert.equal(result.success, true);
+  assert.equal(result.subagents.length, 2);
+  assert.equal(result.subagents[0].toolUseId, 'call_run');
+  assert.equal(result.subagents[0].status, 'running');
+  assert.equal(result.subagents[0].terminal, false);
+  assert.equal(result.subagents[1].toolUseId, 'call_done');
+  assert.equal(result.subagents[1].status, 'completed');
+  assert.equal(result.subagents[1].terminal, true);
+  // The parent transcript is read once, not once per call.
+  assert.equal(reads.filter((id) => id === 'ses_parent').length, 1);
+});
+
+test('listSubagentStatuses reports a parent read failure without inventing state', async () => {
+  const result = await listSubagentStatuses({ parentSessionId: 'ses_parent' }, {
+    listMessages: async () => { throw new Error('bridge down'); },
+    listSessions: async () => [],
+  });
+  assert.equal(result.success, false);
+  assert.deepEqual(result.subagents, []);
+  assert.match(result.error, /bridge down/);
 });

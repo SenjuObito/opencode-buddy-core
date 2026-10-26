@@ -54,7 +54,7 @@ const ABORTED_NOTICE = '已停止生成';
  * showed up with an empty result). v1 keeps the plain-string form, so a string
  * passes straight through.
  */
-function flattenToolContent(content) {
+export function flattenToolContent(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   const parts = [];
@@ -926,6 +926,41 @@ async function resolveSummarizeModel(model, sessionId, directory) {
  * @returns {Promise<object | null>} `{ url, ... }` on success
  */
 export async function shareSession(sessionId, directory) {
+  if (engineRegistry.isV2()) {
+    // The v2 SDK in some installs still points at the legacy `/session/{id}/share`
+    // route, which the v2 server answers with 405. The v2 REST route is
+    // `/api/session/{id}/share`; use it directly like revert/fork do.
+    const headers = { ...getAuthHeader(), 'Content-Type': 'application/json' };
+    if (directory) {
+      headers['x-opencode-directory'] = encodeURIComponent(directory);
+    }
+    const query = directory ? `?directory=${encodeURIComponent(directory)}` : '';
+    let res = await fetch(
+      `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/share${query}`,
+      { method: 'POST', headers },
+    );
+    if (!res.ok && res.status === 404) {
+      // Alternate v2 build that mounts the share route without the `/api` prefix.
+      res = await fetch(
+        `${getEffectiveBaseUrl()}/session/${encodeURIComponent(sessionId)}/share${query}`,
+        { method: 'POST', headers },
+      );
+    }
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(`Share failed: HTTP ${res.status}${errText ? ` - ${errText}` : ''}`);
+    }
+    const text = await res.text().catch(() => '');
+    try {
+      const json = JSON.parse(text);
+      // The route returns the updated session (`{ share: { url } }`); some
+      // builds wrap it in `{ data }`.
+      return json?.data || json;
+    } catch {
+      return { url: text };
+    }
+  }
+
   const params = { sessionID: sessionId };
   if (directory) params.directory = directory;
   console.error(`[DEBUG][ShareSession] request sessionID=${sessionId} directory=${directory ?? '-'}`);
@@ -944,6 +979,29 @@ export async function shareSession(sessionId, directory) {
  * @returns {Promise<void>}
  */
 export async function unshareSession(sessionId, directory) {
+  if (engineRegistry.isV2()) {
+    const headers = { ...getAuthHeader() };
+    if (directory) {
+      headers['x-opencode-directory'] = encodeURIComponent(directory);
+    }
+    const query = directory ? `?directory=${encodeURIComponent(directory)}` : '';
+    let res = await fetch(
+      `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/share${query}`,
+      { method: 'DELETE', headers },
+    );
+    if (!res.ok && res.status === 404) {
+      res = await fetch(
+        `${getEffectiveBaseUrl()}/session/${encodeURIComponent(sessionId)}/share${query}`,
+        { method: 'DELETE', headers },
+      );
+    }
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(`Unshare failed: HTTP ${res.status}${errText ? ` - ${errText}` : ''}`);
+    }
+    return;
+  }
+
   const params = { sessionID: sessionId };
   if (directory) params.directory = directory;
   const result = await getClient().session.unshare(params);
@@ -1709,8 +1767,20 @@ export async function listMessages(sessionId, directory, options = {}) {
       return 0;
     };
 
+    // A v2 compaction record can arrive without a timestamp. Treating that as
+    // time 0 sorted the summary card to the very top of the conversation; it is
+    // the new context boundary and belongs after the messages it summarizes.
+    const maxKnownTime = list.reduce((max, m) => Math.max(max, extractTimeMs(m)), 0);
+    const sortTime = (m) => {
+      const time = extractTimeMs(m);
+      if (time > 0) return time;
+      if (m && typeof m === 'object' && (m.type === 'compaction' || m.info?.role === 'compaction')) {
+        return maxKnownTime + 1;
+      }
+      return 0;
+    };
     const sortedList = [...list].sort((a, b) => {
-      const diff = extractTimeMs(a) - extractTimeMs(b);
+      const diff = sortTime(a) - sortTime(b);
       return Number.isFinite(diff) ? diff : 0;
     });
 
@@ -1724,10 +1794,12 @@ export async function listMessages(sessionId, directory, options = {}) {
         if (m.info.role === 'compaction') {
           m.info.isCompactSummary = true;
           if (!m.info.compactMetadata) {
-            const summaryPart = m.parts.find(p => p.type === 'text');
+            // The summary is the message body, not a user instruction: copying
+            // it into `userContext` made the webview print the whole summary
+            // again as "Context: ...". `userContext` stays reserved for a real
+            // /compact focus supplied by the user.
             m.info.compactMetadata = {
-              trigger: 'manual',
-              userContext: summaryPart?.text || '',
+              trigger: m.info.reason || 'manual',
             };
           }
         }
@@ -1752,9 +1824,10 @@ export async function listMessages(sessionId, directory, options = {}) {
           role: 'compaction',
           time: m.time || {},
           isCompactSummary: true,
+          // The summary is the text part; `userContext` means a user-supplied
+          // focus for /compact and must not be filled with the summary itself.
           compactMetadata: {
             trigger: m.reason || 'manual',
-            userContext: summaryText,
             ...(m.metadata && typeof m.metadata === 'object' ? m.metadata : {}),
           },
           sessionID: sessionId,

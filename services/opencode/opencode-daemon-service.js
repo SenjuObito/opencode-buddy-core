@@ -23,6 +23,7 @@
  *   [QUESTION_REQUEST] {...}           question.asked passthrough (Phase 4)
  *   [QUESTION_CLOSED] {...}            question replied/rejected server-side
  *   [PERMISSION_CLOSED] {...}          permission.replied server-side
+ *   [SUBAGENT_STATUS] {...}            background child terminal (parent session envelope)
  *   [USAGE] {...}                      { input_tokens, output_tokens, ... }
  *   [MESSAGE_END] <full message json>
  *   [STREAM_END] <sessionId>
@@ -56,6 +57,15 @@ import {
   normalizeQuestionRequest,
 } from './event-normalize.js';
 import { resolvePendingCompaction } from './compaction-tracker.js';
+import { getSubagentHistory } from './subagent-service.js';
+import {
+  canonicalStatus,
+  createSubagentMonitor,
+  isBackgroundLaunch,
+  isSubagentToolName,
+  parseSubagentNotice,
+  summarizeMessages,
+} from './subagent-monitor.js';
 import { requestContext, bindSession, runWithIdentity } from '../../request-context.js';
 
 // =============================================================================
@@ -99,6 +109,19 @@ const _sessions = new Map();
 const _sessionTodos = new Map();
 let _todoRevision = 0;
 
+/**
+ * Background subagent watches (v1 `task`, v2 `subagent`).
+ *
+ * The parent tool part is a launch acknowledgement, so the terminal state is
+ * resolved from the child session: the engine's own child-session terminal
+ * event and its synthetic `<subagent … state=…>` notice both feed this watch
+ * list, and only core's canonical transcript read is allowed to decide the
+ * status that reaches the host.
+ */
+const _subagentMonitor = createSubagentMonitor();
+/** Test seam: the canonical transcript reader (defaults to subagent-service). */
+let _subagentHistoryReader = getSubagentHistory;
+
 // ── Test seams ──────────────────────────────────────────────────────────────
 // `_handleEvent`, `_activeTurns`, `_createTurn`, `_settleTurn` and
 // `_emitTurnEndOnce` are exported (underscore-prefixed, like `_handleToolPart`)
@@ -110,6 +133,9 @@ export { _handleEvent, _activeTurns, _createTurn, _settleTurn, _emitTurnEndOnce,
 /** session 目录注册表上限：超限按插入序丢最旧（近似 LRU）。条目极小，但
  * 常驻 daemon 生命周期内无界增长没有任何收益。 */
 const MAX_TRACKED_SESSIONS = 1000;
+
+/** One delayed re-read of a child transcript that lagged its terminal event. */
+const SUBAGENT_TERMINAL_RETRY_MS = 1_500;
 
 function trackSession(sessionId, info) {
   if (!sessionId || typeof sessionId !== 'string') return;
@@ -620,6 +646,334 @@ function noteUnhandledEventType(type) {
   logDebug('unhandled event type (no case in this build):', type);
 }
 
+// =============================================================================
+// Subagent lifecycle (v1 `task` / v2 `subagent`)
+// =============================================================================
+
+function _flattenText(value) {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return value.map(_flattenText).filter(Boolean).join('\n');
+  if (value && typeof value === 'object') {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
+/**
+ * Resolve the child session id from a launch acknowledgement.
+ *
+ * v2 carries it as `metadata.sessionID` on the tool part and inside the ack
+ * output object; v1 carries it on `state.metadata`/`state.output`. All shapes
+ * are tolerated here so the watch registration never depends on the engine.
+ */
+function _childSessionIdFrom({ metadata, input, output } = {}) {
+  const candidates = [
+    metadata?.sessionID, metadata?.sessionId,
+    output?.sessionID, output?.sessionId,
+    output?.metadata?.sessionID, output?.metadata?.sessionId,
+    input?.sessionID, input?.sessionId,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+  }
+  const text = _flattenToolOutput(output);
+  const match = /"sessionI[dD]"\s*:\s*"([^"]+)"/.exec(text);
+  return match ? match[1] : null;
+}
+
+/**
+ * A background launch acknowledgement looks like
+ * `{ "sessionID": "ses_…", "status": "running", "output": [ … ] }`.
+ *
+ * The input flag is authoritative when present; this shape is the fallback for
+ * engine builds that deliver the flag and the result in separate events.
+ */
+function _looksLikeLaunchAck(output) {
+  const text = _flattenToolOutput(output);
+  return text.length > 0
+    && /"status"\s*:\s*"running"/.test(text)
+    && /"sessionI[dD]"\s*:/.test(text);
+}
+
+/** The tool input observed at call time, or the snapshot the turn kept. */
+function _toolInputFrom(turn, callID, props) {
+  if (props?.input && typeof props.input === 'object' && !Array.isArray(props.input)) return props.input;
+  const raw = turn?.toolUseInput?.get(callID);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function _subagentDescriptionFrom(input) {
+  if (!input || typeof input !== 'object') return '';
+  for (const key of ['description', 'summary', 'task']) {
+    const value = input[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+/** Flatten a tool result from either engine: v1 sends a string, v2 a content array. */
+function _flattenToolOutput(output) {
+  if (output == null) return '';
+  if (typeof output === 'string') return output;
+  return sdk.flattenToolContent(output) || _flattenText(output);
+}
+
+/**
+ * A notice that says the child started, not finished (`state="running"`).
+ *
+ * The input flag is authoritative for background launches, but some engine
+ * builds drop it and only leave this acknowledgement, so it is a fallback in
+ * exactly the same way as the `{"status":"running"}` object ack.
+ */
+function _isPendingSubagentState(state) {
+  const value = typeof state === 'string' ? state.trim().toLowerCase() : '';
+  return value === 'running' || value === 'pending' || value === 'started' || value === 'in_progress';
+}
+
+/**
+ * Publish the canonical terminal state of a subagent call.
+ *
+ * Background launches carry an acknowledgement in the parent tool result; their
+ * terminal state lives in the child session and is resolved by the watch list.
+ * Inline (sync) calls are the opposite: the parent tool result IS the child's
+ * final report, so it is terminal evidence and must be published here. Doing it
+ * in core keeps `subagent.status` the single run-state contract for both modes:
+ * the webview never has to decide that "a result means completed" once the
+ * event has arrived.
+ */
+function _registerSubagentCall({
+  parentSessionId,
+  toolUseId,
+  name,
+  input,
+  metadata,
+  output,
+  directory,
+  terminal = false,
+  isError = false,
+}) {
+  if (!isSubagentToolName(name) || !parentSessionId || !toolUseId) return null;
+  const evidence = _flattenToolOutput(output);
+  const notice = parseSubagentNotice(evidence);
+  const background = isBackgroundLaunch(input)
+    || _looksLikeLaunchAck(output)
+    || _isPendingSubagentState(notice?.state);
+  const description = _subagentDescriptionFrom(input) || notice?.description || '';
+  const childSessionId = _childSessionIdFrom({ metadata, input, output })
+    || notice?.childSessionId
+    || null;
+
+  if (!background) {
+    if (!terminal) return null;
+    // An inline call's result is the child's final report. No result text at
+    // all is not terminal evidence: some builds deliver the launch ack in a
+    // later event, and completing here would flip a background run on its ack.
+    if (!isError && !notice && !evidence.trim()) return null;
+    const call = { parentSessionId, toolUseId, description, childSessionId, directory };
+    const status = canonicalStatus(notice?.state) || (isError ? 'failed' : 'completed');
+    _emitSubagentStatus(call, status, { summary: notice?.body });
+    logDebug('subagent', `inline terminal tool=${toolUseId} status=${status} parent=${parentSessionId}`);
+    return call;
+  }
+
+  // A background launch that already failed never produced a child; publish the
+  // failure instead of registering a watch that waits for a signal that cannot
+  // arrive.
+  if (terminal && isError) {
+    const call = { parentSessionId, toolUseId, description, childSessionId, directory };
+    _emitSubagentStatus(call, 'failed');
+    return call;
+  }
+
+  const call = _subagentMonitor.register({
+    parentSessionId,
+    toolUseId,
+    description,
+    background,
+    childSessionId,
+    directory,
+  });
+  if (call) {
+    logDebug('subagent', `watch registered tool=${toolUseId} parent=${parentSessionId} `
+      + `child=${call.childSessionId || '-'} description=${call.description || '-'}`);
+  }
+  return call;
+}
+
+/**
+ * Emit one terminal status for a watched subagent, exactly once.
+ *
+ * The marker is tagged with the PARENT session: the parent tab may be idle and
+ * may not be streaming at all when a background child finishes, and the host
+ * routes out-of-turn markers by that envelope session.
+ */
+function _emitSubagentStatus(call, status, { result, summary } = {}) {
+  if (!call || !status || _subagentMonitor.hasEmitted(call.toolUseId)) return;
+  if (!call.childSessionId) {
+    const child = result?.childSessionID;
+    if (typeof child === 'string' && child) call.childSessionId = child;
+  }
+  _subagentMonitor.markEmitted(call.toolUseId);
+
+  // The notice body can be the child's whole report; keep the event payload
+  // bounded the same way summarizeMessages bounds a transcript summary.
+  const noticeText = typeof summary === 'string' ? summary.trim() : '';
+  const clipped = noticeText.length > 500 ? `${noticeText.slice(0, 500)}…` : noticeText;
+  const text = clipped || summarizeMessages(result?.messages);
+  const payload = {
+    parentSessionId: call.parentSessionId,
+    toolUseId: call.toolUseId,
+    childSessionId: call.childSessionId || null,
+    status,
+    ...(call.description ? { description: call.description } : {}),
+    ...(text ? { summary: text } : {}),
+  };
+  logInfo('subagent', `terminal tool=${call.toolUseId} status=${status} `
+    + `parent=${call.parentSessionId} child=${call.childSessionId || '-'}`);
+  runWithIdentity(
+    { sessionId: call.parentSessionId },
+    () => emitJsonStringMarker('[SUBAGENT_STATUS]', payload),
+  );
+}
+
+/**
+ * Resolve a watch from one terminal signal.
+ *
+ * The child transcript is canonical, so a still-`running` transcript vetoes the
+ * emission and keeps the watch (the notice path or the next parent settle will
+ * try again). Only when the transcript cannot be read at all does the terminal
+ * event itself decide the status.
+ */
+async function _resolveSubagentTerminal(call, hint) {
+  if (!call) return false;
+  let result = null;
+  try {
+    result = await _subagentHistoryReader({
+      parentSessionId: call.parentSessionId,
+      toolUseId: call.toolUseId,
+      description: call.description,
+      directory: call.directory,
+    });
+  } catch (error) {
+    logWarn('subagent', `transcript read failed tool=${call.toolUseId} `
+      + `${error?.message || String(error)}`);
+  }
+
+  const fromTranscript = result && result.success !== false ? canonicalStatus(result.status) : null;
+  const status = fromTranscript || (result && result.success !== false ? null : canonicalStatus(hint));
+  if (!status) {
+    logDebug('subagent', `still running tool=${call.toolUseId} hint=${hint || '-'}`);
+    return false;
+  }
+  _emitSubagentStatus(call, status, { result });
+  return true;
+}
+
+function _handleSubagentChildTerminal(childSessionId, hint, { allowRetry = true } = {}) {
+  const call = _subagentMonitor.resolveByChild(childSessionId);
+  if (!call || call.inFlight) return Promise.resolve(false);
+  call.inFlight = true;
+  return _resolveSubagentTerminal(call, hint)
+    .then((emitted) => {
+      if (emitted || !allowRetry || !_subagentMonitor.get(call.toolUseId)) return emitted;
+      // The child transcript can lag its terminal event by a few hundred ms.
+      // One bounded re-read (never an interval); the notice path and the next
+      // parent settle are still there if this also lands too early.
+      const timer = setTimeout(() => {
+        if (!_subagentMonitor.get(call.toolUseId)) return;
+        _handleSubagentChildTerminal(childSessionId, hint, { allowRetry: false })
+          .catch((error) => logWarn('subagent', `terminal retry failed ${error?.message || error}`));
+      }, SUBAGENT_TERMINAL_RETRY_MS);
+      timer.unref?.();
+      return emitted;
+    })
+    .finally(() => {
+      call.inFlight = false;
+    });
+}
+
+/**
+ * The engine writes a synthetic parent message when a background child ends:
+ * {@code <subagent sessionID="…" state="completed" description="…">…</subagent>}.
+ * Because it arrives outside any parent turn it must be handled here, not in
+ * `_handlePartUpdated`.
+ */
+function _maybeHandleSubagentNotice(props, parentSessionId) {
+  const part = props?.part;
+  if (!part || part.type !== 'text') return;
+  _handleSubagentNoticeText(part.text, parentSessionId);
+}
+
+/** `message.updated` can carry the whole part list instead of a single part. */
+function _maybeHandleSubagentNoticeFromMessage(props, parentSessionId) {
+  const parts = Array.isArray(props?.parts) ? props.parts : [];
+  for (const part of parts) {
+    if (!part || part.type !== 'text') continue;
+    _handleSubagentNoticeText(part.text, parentSessionId);
+  }
+}
+
+function _handleSubagentNoticeText(text, parentSessionId) {
+  const notice = parseSubagentNotice(text);
+  if (!notice) return;
+
+  let call = _subagentMonitor.resolveByChild(notice.childSessionId);
+  if (!call && parentSessionId) {
+    call = _subagentMonitor.findByDescription(parentSessionId, notice.description);
+    if (call) _subagentMonitor.attachChild(call.toolUseId, notice.childSessionId);
+  }
+  if (!call) return;
+  const status = canonicalStatus(notice.state);
+  if (!status) return;
+  _emitSubagentStatus(call, status, { summary: notice.body });
+}
+
+/**
+ * One-shot reconciliation when a parent turn settles.
+ *
+ * Not a timer: it runs once per settle and exists for the race where the child
+ * finished before its watch was registered (or before the terminal event was
+ * delivered). A still-running child simply stays watched.
+ */
+function _reconcileSubagentsForParent(parentSessionId) {
+  if (!parentSessionId) return Promise.resolve([]);
+  const pending = [];
+  for (const call of _subagentMonitor.pendingForParent(parentSessionId)) {
+    if (call.inFlight || _subagentMonitor.hasEmitted(call.toolUseId)) continue;
+    call.inFlight = true;
+    pending.push(_resolveSubagentTerminal(call, null).finally(() => {
+      call.inFlight = false;
+    }));
+  }
+  return Promise.all(pending);
+}
+
+/** Test seams for the subagent watch list (not part of the daemon API). */
+export function _setSubagentHistoryReaderForTest(reader) {
+  _subagentHistoryReader = typeof reader === 'function' ? reader : getSubagentHistory;
+}
+
+export function _resetSubagentsForTest() {
+  _subagentMonitor.reset();
+  _subagentHistoryReader = getSubagentHistory;
+}
+
+export { _subagentMonitor };
+export {
+  _handleSubagentChildTerminal,
+  _reconcileSubagentsForParent,
+};
+
 function _dispatchInnerEvent(type, props, sessionID, turn) {
   switch (type) {
     case 'session.created':
@@ -662,6 +1016,9 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     }
     case 'message.part.updated':
     case 'message.part.created':
+      // Background children end outside the parent turn, so the engine's
+      // synthetic notice has to be inspected before the turn gate.
+      _maybeHandleSubagentNotice(props, sessionID);
       if (turn) _handlePartUpdated(props, turn);
       break;
     case 'message.part.delta':
@@ -678,6 +1035,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
           }
         }
       }
+      _maybeHandleSubagentNoticeFromMessage(props, sessionID);
       break;
     }
     case 'message.removed':
@@ -780,6 +1138,15 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
             _emitTodos(sessionID || turn.sessionId, input.todos, type);
           }
           maybeEmitQuestionPrompt(turn, sessionID, callID, name, input);
+          _registerSubagentCall({
+            parentSessionId: sessionID || turn.sessionId,
+            toolUseId: callID,
+            name,
+            input,
+            metadata: props.metadata,
+            output: props.output,
+            directory: _sessions.get(sessionID || turn.sessionId)?.directory,
+          });
         }
       }
       break;
@@ -800,6 +1167,23 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
             content = props.output ?? props.result ?? '';
           }
           emitToolResultMessage({ toolUseId: callID, content, isError });
+          const name = turn.toolNames.get(callID) || props.name || props.tool || '';
+          if (isSubagentToolName(name)) {
+            _registerSubagentCall({
+              parentSessionId: sessionID || turn.sessionId,
+              toolUseId: callID,
+              name,
+              input: _toolInputFrom(turn, callID, props),
+              metadata: props.metadata,
+              output: props.output ?? props.content ?? props.result,
+              directory: _sessions.get(sessionID || turn.sessionId)?.directory,
+              terminal: true,
+              isError,
+            });
+            // A failed launch never produced a child: do not keep a watch that
+            // would otherwise wait for a terminal signal that cannot arrive.
+            if (isError) _subagentMonitor.drop(callID);
+          }
         }
       }
       break;
@@ -861,6 +1245,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     case 'session.idle':
     case 'session.execution.succeeded':
       if (turn) _settleTurn(turn, { success: true });
+      else if (sessionID) _handleSubagentChildTerminal(sessionID, 'completed');
       break;
     case 'session.step.failed':
     case 'session.next.step.failed': {
@@ -906,6 +1291,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     case 'session.error':
     case 'session.execution.failed': {
       const isCompactionFailed = type.includes('compaction');
+      if (!turn && sessionID) _handleSubagentChildTerminal(sessionID, 'failed');
       const err = props?.error || props?.data?.error || { message: type };
       if (turn && !isCompactionFailed) {
         _settleTurn(turn, { success: false, error: err });
@@ -1083,10 +1469,31 @@ export function _handleToolPart(part, turn) {
       && !turn.toolResultDone.has(callID)) {
     turn.toolResultDone.add(callID);
     const isError = status === 'error' || status === 'failed';
-    const content = isError ? (state.error || '') : (state.output ?? '');
+    // v2 moved the tool output out of `state.output` and into `state.content`
+    // (`[{type:'text', text}]`). Reading only `output` emitted an empty
+    // tool_result for every v2 part that reaches its terminal state here, and
+    // `toolResultDone` then suppressed the richer `session.tool.success` path —
+    // the card stayed empty/spinning even though the result existed. `listMessages`
+    // already flattens this shape; reuse the same helper so the two paths agree.
+    const output = state.output ?? state.content;
+    const content = isError ? (state.error || '') : _flattenToolOutput(output);
     logDebug('emitToolResultMessage:', 'toolUseId:', callID, 'isError:', isError,
       'contentLength:', typeof content === 'string' ? content.length : 0);
-    emitToolResultMessage({ toolUseId: callID, content, isError });
+    emitToolResultMessage({ toolUseId: callID, isError, content });
+  }
+  if (isSubagentToolName(name) && callID) {
+    _registerSubagentCall({
+      parentSessionId: turn.sessionId,
+      toolUseId: callID,
+      name,
+      input,
+      metadata: state.metadata,
+      output: state.output ?? state.content,
+      directory: _sessions.get(turn.sessionId)?.directory,
+      terminal: status === 'completed' || status === 'error' || status === 'failed',
+      isError: status === 'error' || status === 'failed',
+    });
+    if (status === 'error' || status === 'failed') _subagentMonitor.drop(callID);
   }
 }
 
@@ -1128,6 +1535,11 @@ function _settleTurn(turn, { success, error, reason } = {}) {
     },
     () => _reconcileToolParts(turn),
   );
+  // One-shot subagent reconciliation: a background child that finished before
+  // its watch was registered (or whose terminal event was missed) is resolved
+  // here. This is not a poll — it runs once per settle and only touches calls
+  // still pending for this parent.
+  _reconcileSubagentsForParent(turn.sessionId);
   turn.success = success;
   if (success) {
     turn.resolve({ ok: true });

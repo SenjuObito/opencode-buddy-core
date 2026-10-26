@@ -121,3 +121,65 @@ test('tool part — shell 工具名被归一化为 bash', () => {
   assert.equal(emitted[0].name, 'bash', 'shell 工具名应归一化为 bash');
   assert.deepEqual(emitted[0].input, { command: 'pwd' });
 });
+
+/** 捕获 [MESSAGE] 标记里的 tool_result 块。 */
+function collectToolResults(run) {
+  const emitted = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (line) => {
+    if (typeof line === 'string' && line.startsWith('[MESSAGE] ')) {
+      const msg = JSON.parse(line.slice('[MESSAGE] '.length));
+      for (const block of msg?.message?.content ?? []) {
+        if (block.type === 'tool_result') emitted.push(block);
+      }
+    }
+  };
+  console.error = () => {};
+  try {
+    run();
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+  return emitted;
+}
+
+test('tool part — v2 的 state.content 数组摊平成 tool_result 文本', () => {
+  // v2 把工具结果放在 state.content（[{type:'text',text}]），state.output 为空。
+  // 只读 output 会发一个空 tool_result，并用 toolResultDone 压掉随后
+  // session.tool.success 的完整内容，前端卡片就一直空着/转圈。
+  const turn = createTurn();
+  const part = { id: 'call_v2', type: 'tool', tool: 'subagent', state: {} };
+
+  const results = collectToolResults(() => {
+    part.state = { status: 'running', input: { agent: 'explore' } };
+    _handleToolPart(part, turn);
+    part.state = {
+      status: 'completed',
+      input: { agent: 'explore' },
+      content: [{ type: 'text', text: '<subagent sessionID="ses_child" state="completed">done</subagent>' }],
+    };
+    _handleToolPart(part, turn);
+  });
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].tool_use_id, 'call_v2');
+  assert.match(results[0].content, /state="completed"/);
+  assert.equal(results[0].is_error, false);
+});
+
+test('tool part — v1 的字符串 state.output 原样保留', () => {
+  const turn = createTurn();
+  const part = { id: 'call_v1', type: 'tool', tool: 'bash', state: {} };
+
+  const results = collectToolResults(() => {
+    part.state = { status: 'running', input: { command: 'ls' } };
+    _handleToolPart(part, turn);
+    part.state = { status: 'completed', input: { command: 'ls' }, output: 'a.txt\nb.txt' };
+    _handleToolPart(part, turn);
+  });
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].content, 'a.txt\nb.txt');
+});

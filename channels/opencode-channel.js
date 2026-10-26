@@ -5,7 +5,10 @@
 import { sendMessage as openCodeSendMessage } from '../services/opencode/message-service.js';
 import { listModels as openCodeListModels, ensureServerReady } from '../services/opencode/models-service.js';
 import { getSessionDirectory } from '../services/opencode/opencode-daemon-service.js';
-import { getSubagentHistory as openCodeGetSubagentHistory } from '../services/opencode/subagent-service.js';
+import {
+  getSubagentHistory as openCodeGetSubagentHistory,
+  listSubagentStatuses as openCodeListSubagentStatuses,
+} from '../services/opencode/subagent-service.js';
 import * as engineRegistry from '../services/opencode/engine-registry.js';
 import {
   replyPermission as openCodeReplyPermission,
@@ -154,6 +157,24 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
         provider: 'opencode',
         sessionId: sessionId || '',
         history: history ?? null,
+      }));
+      break;
+    }
+
+    case 'getSessionSubagents': {
+      const { sessionId, directory, limit } = stdinData || {};
+      await ensureServerReady();
+      const result = await openCodeListSubagentStatuses({
+        parentSessionId: sessionId || '',
+        directory: directory || undefined,
+        limit: Number(limit) || 20,
+      });
+      console.log(JSON.stringify({
+        success: result.success !== false,
+        provider: 'opencode',
+        sessionId: sessionId || '',
+        subagents: result.subagents ?? [],
+        ...(result.error ? { error: result.error } : {}),
       }));
       break;
     }
@@ -389,7 +410,7 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
 
 export function getOpenCodeCommandList() {
   return [
-    'send', 'listModels', 'listMessages', 'getSubagentHistory', 'getSessionInfo', 'listAgents', 'listCommands',
+    'send', 'listModels', 'listMessages', 'getSubagentHistory', 'getSessionSubagents', 'getSessionInfo', 'listAgents', 'listCommands',
     'listMcpServers', 'getMcpStatus', 'replyPermission', 'replyQuestion', 'rejectQuestion',
     'shareSession', 'unshareSession', 'revert', 'unrevert', 'fork', 'summarize',
     'findFiles', 'listSessions', 'deleteSession', 'updateSessionTitle', 'toggleFavorite',

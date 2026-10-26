@@ -10,6 +10,7 @@
  */
 
 import { listMessages, listSessions } from './opencode-sdk-client.js';
+import { isBackgroundLaunch, isSubagentToolName, summarizeMessages } from './subagent-monitor.js';
 
 const SUBAGENT_SESSION = /<subagent\b[^>]*\bsessionID\s*=\s*"([^"]+)"/i;
 const POLL_TAIL_MESSAGES = 200;
@@ -204,14 +205,18 @@ export async function getSubagentHistory(params = {}, deps = { listMessages, lis
   }
 
   let parentEntries;
-  try {
-    parentEntries = await deps.listMessages(parentSessionId, directory);
-  } catch (error) {
-    return {
-      ...runningResponse(base, 'Failed to load parent transcript'),
-      success: false,
-      error: error?.message || String(error),
-    };
+  if (Array.isArray(params.parentEntries)) {
+    parentEntries = params.parentEntries;
+  } else {
+    try {
+      parentEntries = await deps.listMessages(parentSessionId, directory);
+    } catch (error) {
+      return {
+        ...runningResponse(base, 'Failed to load parent transcript'),
+        success: false,
+        error: error?.message || String(error),
+      };
+    }
   }
 
   const found = findTool(parentEntries, toolUseId);
@@ -262,4 +267,105 @@ export async function getSubagentHistory(params = {}, deps = { listMessages, lis
     messages: convertEntries(childEntries),
     ...(found.output ? { resultText: found.output } : {}),
   };
+}
+
+/**
+ * Every background subagent call in a parent transcript, newest first.
+ *
+ * v1 names the tool `task` and v2 `subagent`; the background flag is likewise
+ * `run_in_background` vs `background`. Both are normalised here so the caller
+ * (the daemon's reload reconciliation) never branches on the engine.
+ */
+export function collectSubagentCalls(entries) {
+  const calls = [];
+  const seen = new Set();
+  for (const entry of asArray(entries)) {
+    for (const part of asArray(obj(entry)?.parts)) {
+      const record = obj(part);
+      if (!record) continue;
+      const type = firstText(record.type);
+      if (type !== 'tool' && type !== 'tool_use') continue;
+      const toolUseId = firstText(record.id, record.callID, record.callId);
+      if (!toolUseId || seen.has(toolUseId)) continue;
+      if (!isSubagentToolName(firstText(record.tool, record.name))) continue;
+
+      const state = obj(record.state) || {};
+      const input = obj(state.input) ?? obj(record.input) ?? {};
+      if (!isBackgroundLaunch(input)) continue;
+
+      seen.add(toolUseId);
+      const metadata = obj(state.metadata) || {};
+      const output = firstText(state.output, flattenContent(state.content));
+      let childSessionId = firstText(metadata.sessionID, metadata.sessionId);
+      if (!childSessionId && output) {
+        const match = SUBAGENT_SESSION.exec(output)
+          || /"sessionI[dD]"\s*:\s*"([^"]+)"/.exec(output);
+        if (match) childSessionId = match[1];
+      }
+      calls.push({
+        toolUseId,
+        description: firstText(input.description, input.summary, input.task),
+        childSessionId: childSessionId || null,
+      });
+    }
+  }
+  // Later parts are newer; a session's most recent launches matter most.
+  return calls.reverse();
+}
+
+/**
+ * Canonical status for every background subagent in a session.
+ *
+ * Used once per history load so a reopened session shows the real state instead
+ * of the launch acknowledgement that was persisted with the transcript. This is
+ * a bounded, on-demand read — not a poll.
+ *
+ * @param {object} params
+ * @param {string} params.parentSessionId
+ * @param {string} [params.directory]
+ * @param {number} [params.limit]
+ * @param {{ listMessages: Function, listSessions: Function }} [deps]
+ */
+export async function listSubagentStatuses(params = {}, deps = { listMessages, listSessions }) {
+  const parentSessionId = textOf(params.parentSessionId);
+  const directory = params.directory || undefined;
+  const requested = Number(params.limit);
+  const limit = Number.isFinite(requested) && requested > 0 ? Math.min(requested, 50) : 20;
+  if (!parentSessionId) {
+    return { success: false, parentSessionId: '', subagents: [], error: 'Missing parent session' };
+  }
+
+  let parentEntries;
+  try {
+    parentEntries = await deps.listMessages(parentSessionId, directory);
+  } catch (error) {
+    return {
+      success: false,
+      parentSessionId,
+      subagents: [],
+      error: error?.message || String(error),
+    };
+  }
+
+  const calls = collectSubagentCalls(parentEntries).slice(0, limit);
+  const subagents = [];
+  for (const call of calls) {
+    const history = await getSubagentHistory({
+      parentSessionId,
+      toolUseId: call.toolUseId,
+      description: call.description,
+      directory,
+      parentEntries,
+    }, deps);
+    if (!history?.success) continue;
+    subagents.push({
+      toolUseId: call.toolUseId,
+      childSessionId: history.childSessionID || call.childSessionId || null,
+      description: call.description || '',
+      status: history.status,
+      terminal: history.status === 'completed' || history.status === 'error',
+      ...(history.status !== 'running' ? { summary: summarizeMessages(history.messages) } : {}),
+    });
+  }
+  return { success: true, parentSessionId, subagents };
 }
