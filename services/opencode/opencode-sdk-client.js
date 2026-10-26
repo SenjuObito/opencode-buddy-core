@@ -1124,14 +1124,24 @@ export async function unrevertSession(sessionId, directory) {
  */
 export async function forkSession(sessionId, messageID, directory) {
   if (engineRegistry.isV2()) {
-    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/fork`;
+    const headers = { ...getAuthHeader(), 'Content-Type': 'application/json' };
+    if (directory) {
+      headers['x-opencode-directory'] = encodeURIComponent(directory);
+    }
+    const query = directory ? `?directory=${encodeURIComponent(directory)}` : '';
+    const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/fork${query}`;
+    const body = {};
+    if (messageID) {
+      body.before = messageID;
+    }
     const res = await fetch(url, {
       method: 'POST',
-      headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
-      body: JSON.stringify(messageID ? { messageID } : {}),
+      headers,
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
-      throw new Error(`Fork failed: HTTP ${res.status}`);
+      const errText = await res.text().catch(() => '');
+      throw new Error(`Fork failed: HTTP ${res.status}${errText ? ` - ${errText}` : ''}`);
     }
     const json = await res.json();
     return json.data || json;
