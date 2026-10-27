@@ -223,6 +223,9 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
 
     case 'listAgents': {
       const { directory } = stdinData || {};
+      // 与 listMessages/getSessionInfo 同因：启动预取会在 serve 就绪前发出，
+      // 不等就绪时首个请求失败并被 getAgents 吞成空数组——模式下拉只剩硬编码兜底。
+      await ensureServerReady();
       const agents = await openCodeGetAgents(directory || undefined);
       // 输出约定与 listModels/listMessages 一致：单行 JSON（daemon 模式包装为 {id,line}）。
       console.log(JSON.stringify({
@@ -235,6 +238,7 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
 
     case 'listCommands': {
       const { directory } = stdinData || {};
+      await ensureServerReady();
       const commands = await openCodeGetCommands(directory || undefined);
       console.log(JSON.stringify({
         success: true,

@@ -1405,7 +1405,12 @@ export async function getAgents(directory) {
   if (engineRegistry.isV2()) {
     try {
       const url = `${getEffectiveBaseUrl()}/api/agent`;
-      const res = await fetch(url, { headers: getAuthHeader() });
+      // v2 resolves project-level agents from the directory header; without it
+      // the engine answers for its own cwd and project `.opencode/agent/*.md`
+      // never shows up in the list.
+      const headers = getAuthHeader();
+      if (directory) headers['x-opencode-directory'] = encodeURIComponent(directory);
+      const res = await fetch(url, { headers });
       if (!res.ok) return [];
       const json = await res.json();
       return Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []);
@@ -1429,7 +1434,9 @@ export async function getCommands(directory) {
   if (engineRegistry.isV2()) {
     try {
       const url = `${getEffectiveBaseUrl()}/api/command`;
-      const res = await fetch(url, { headers: getAuthHeader() });
+      const headers = getAuthHeader();
+      if (directory) headers['x-opencode-directory'] = encodeURIComponent(directory);
+      const res = await fetch(url, { headers });
       if (!res.ok) return [];
       const json = await res.json();
       return Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []);

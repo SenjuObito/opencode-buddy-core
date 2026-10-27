@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as registry from './engine-registry.js';
 import {
   createSession,
+  getAgents,
   listMessages,
   listSessions,
   normalizeDirForMatch,
@@ -517,6 +518,42 @@ test('v2 shareSession falls back to the unprefixed route on 404', async () => {
     assert.equal(stub.calls.length, 2);
     assert.equal(stub.calls[1].path, `/session/${SESSION_ID}/share`);
     assert.equal(share.share.url, 'https://opencode.ai/s/y');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v2 getAgents requests /api/agent and forwards the directory header', async () => {
+  lockV2();
+  const stub = stubFetch(() =>
+    jsonResponse({
+      location: { directory: '/repo' },
+      data: [
+        { id: 'build', mode: 'primary', hidden: false },
+        { id: 'winui-dev', mode: 'primary', hidden: false },
+      ],
+    }),
+  );
+  try {
+    const agents = await getAgents('/repo');
+    assert.equal(stub.calls.length, 1);
+    assert.equal(stub.calls[0].path, '/api/agent');
+    // Without this header the engine resolves agents against its own cwd, so a
+    // project-level primary agent is missing from the mode selector.
+    assert.equal(stub.calls[0].init.headers['x-opencode-directory'], encodeURIComponent('/repo'));
+    assert.deepEqual(agents.map((a) => a.id), ['build', 'winui-dev']);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v2 getAgents omits the directory header when no directory is given', async () => {
+  lockV2();
+  const stub = stubFetch(() => jsonResponse({ data: [{ id: 'build', mode: 'primary' }] }));
+  try {
+    await getAgents();
+    assert.equal(stub.calls.length, 1);
+    assert.equal(stub.calls[0].init.headers['x-opencode-directory'], undefined);
   } finally {
     stub.restore();
   }
