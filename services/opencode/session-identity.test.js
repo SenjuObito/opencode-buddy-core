@@ -331,3 +331,46 @@ test('_resolveSession creates new session if requested session belongs to differ
     registry.reset();
   }
 });
+
+test('session.status:retry with free_tier_limit immediately settles the active turn', () => {
+  const turn = _createTurn('10', 'ses_quota');
+  let rejectedError = null;
+  turn.promise = new Promise((resolve, reject) => {
+    turn.resolve = resolve;
+    turn.reject = (err) => { rejectedError = err; reject(err); };
+  });
+  // catch rejection so unhandled rejection doesn't fail the test runner
+  turn.promise.catch(() => {});
+  _activeTurns.set('ses_quota', turn);
+
+  try {
+    const emitted = captureEmits(() => {
+      _handleEvent({
+        type: 'session.status',
+        properties: {
+          sessionID: 'ses_quota',
+          status: {
+            type: 'retry',
+            attempt: 1,
+            next: Date.now() + 3600000,
+            message: 'Free usage exceeded, subscribe to Go',
+            action: {
+              reason: 'free_tier_limit',
+              link: 'https://opencode.ai/go',
+            },
+          },
+        },
+      });
+    });
+
+    assert.equal(turn.settled, true, 'turn must be settled immediately');
+    assert.equal(turn.success, false, 'turn must be settled as failure');
+    assert.equal(turn.settleReason, 'free_tier_limit');
+    assert.match(rejectedError?.message || '', /Free usage exceeded/);
+    const statusLine = emitted.find((e) => e.line.startsWith('[STATUS]'));
+    assert.ok(statusLine, '[STATUS] marker must be emitted');
+  } finally {
+    _activeTurns.delete('ses_quota');
+  }
+});
+

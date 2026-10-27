@@ -816,7 +816,9 @@ function _scheduleTitleReconcile(sessionId) {
     }
     const title = typeof info?.title === 'string' ? info.title : null;
     if (title && !isDefaultSessionTitle(title)) {
-      _emitSessionTitle(sessionId, title);
+      requestContext.run({ id: null, sessionId }, () => {
+        _emitSessionTitle(sessionId, title);
+      });
       return;
     }
     attempt += 1;
@@ -1419,10 +1421,33 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
           next: typeof status.next === 'number' ? status.next : null,
           action,
         };
-        // 记在本回合上：180s 兜底文案要带上服务端的原话，而不是继续瞎猜。
+        // 记在本回合上：供报错文案引用。
         if (turn) turn.lastStatusMessage = payload.message;
         logInfo(`[session.status:retry] session=${sessionID} attempt=${payload.attempt} reason=${action?.reason || '-'} msg=${payload.message}`);
         emitJsonStringMarker('[STATUS]', payload);
+
+        // 如果是免费额度已用尽（free_tier_limit）或超长退避（例如重试时间在 60 秒以上），
+        // 这属于不可短时自动恢复的额度耗尽，继续等待只会导致前端一直 loading。
+        // 立即结算该回合为失败，并让底层服务端 abort 该会话。
+        const isFreeTierLimit = action?.reason === 'free_tier_limit'
+          || (typeof payload.message === 'string' && /free usage exceeded|free_tier_limit/i.test(payload.message));
+        const isFarFutureRetry = typeof payload.next === 'number' && payload.next - Date.now() > 60_000;
+
+        if (turn && (isFreeTierLimit || isFarFutureRetry)) {
+          emitJsonStringMarker('[TURN_ERROR]', {
+            message: payload.message,
+            error: payload.message,
+            action: payload.action || null,
+          });
+          if (sessionID) {
+            sdk.abort(sessionID).catch(() => {});
+          }
+          _settleTurn(turn, {
+            success: false,
+            error: new Error(payload.message),
+            reason: isFreeTierLimit ? 'free_tier_limit' : 'quota_exceeded',
+          });
+        }
       }
       break;
     }

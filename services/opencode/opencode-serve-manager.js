@@ -610,7 +610,16 @@ async function doStart(port) {
       }
 
       if (!settled) {
-        settle(`opencode 意外退出（退出码: ${code ?? signal}）`, true);
+        let detail = '';
+        if (tail.length > 0) {
+          const joinedTail = tail.slice(-3).join('; ');
+          if (/Database is not empty and has no session table/i.test(joinedTail)) {
+            detail = ': 数据库包含高版本(v2)数据，v1 无法兼容读取，请备份并清理 ~/.local/share/opencode/opencode.db';
+          } else {
+            detail = `: ${tail.slice(-1)[0]}`;
+          }
+        }
+        settle(`opencode 意外退出（退出码: ${code ?? signal}）${detail}`, true);
       } else {
         // Normal exit after a successful start (e.g. stop()) — clear state.
         if (_process === child) {
