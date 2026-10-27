@@ -190,6 +190,31 @@ export async function health() {
 // ── Sessions ──────────────────────────────────────────────────────────────
 
 /**
+ * Prefix the engine uses for an untitled session ("New session - <ISO>").
+ * `Child session - ` is the subagent variant; both are placeholders.
+ */
+const DEFAULT_SESSION_TITLE_PREFIX = 'New session - ';
+const CHILD_SESSION_TITLE_PREFIX = 'Child session - ';
+const DEFAULT_TITLE_PATTERN = new RegExp(
+  `^(${DEFAULT_SESSION_TITLE_PREFIX}|${CHILD_SESSION_TITLE_PREFIX})\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$`,
+);
+
+/**
+ * Whether `title` is one of the engine's placeholders.
+ *
+ * <p>These are not conversation titles: they are the state in which the engine
+ * has not named the session yet. Forwarding one paints a raw ISO string on the
+ * tab, so every title path filters them out and the host keeps its localized
+ * placeholder until the engine names the session.</p>
+ *
+ * @param {unknown} title
+ * @returns {boolean}
+ */
+export function isDefaultSessionTitle(title) {
+  return typeof title === 'string' && DEFAULT_TITLE_PATTERN.test(title);
+}
+
+/**
  * @param {string} [title]
  * @param {string} [directory]
  * @returns {Promise<object>} the created session (with `id`)
@@ -219,6 +244,9 @@ export async function createSession(title, directory, selection) {
     return json.data || json;
   }
   const params = {};
+  // v1 seeds its own `New session - <ISO>` title when none is given, and its
+  // prompt loop names the session from that placeholder. Passing a plugin-made
+  // title here would make the session look already named.
   if (title) params.title = title;
   if (directory) params.directory = directory;
   const result = await getClient().session.create(params);
@@ -407,6 +435,110 @@ export async function updateSessionTitle(id, title, directory) {
     throw new Error(`Failed to update session title: ${JSON.stringify(result.error)}`);
   }
   return result.data;
+}
+
+/**
+ * Ask the engine to generate a title for a session from its own history.
+ *
+ * <p>This is the engine's title generator, not a plugin-side rename: on v2 the
+ * same `PATCH /api/session/:id { title: "" }` call is what the engine's own TUI
+ * issues when the title is cleared, and the resulting name is published as
+ * `session.renamed`. v2's create route does not title a session by itself, so
+ * without this call a session created by the plugin stays unnamed forever and
+ * the tab keeps its placeholder.</p>
+ *
+ * <p>v1 generates the title itself after the first turn, so this is a no-op
+ * there — calling it would blank the existing title.</p>
+ *
+ * @param {string} id
+ * @param {string} [directory]
+ * @returns {Promise<boolean>} whether the engine was asked
+ */
+export async function generateSessionTitle(id, directory) {
+  if (!engineRegistry.isV2()) return false;
+  const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(id)}`;
+  const headers = { ...getAuthHeader(), 'Content-Type': 'application/json' };
+  if (directory) headers['x-opencode-directory'] = encodeURIComponent(directory);
+  const res = await fetch(url, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify({ title: '' }),
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to generate session title: HTTP ${res.status} ${await res.text()}`);
+  }
+  return true;
+}
+
+/**
+ * Prompt sent to the engine when the plugin has to fall back to engine-side
+ * text generation for a title. Deliberately the same contract the engine's own
+ * title generator uses: reply with the title only.
+ */
+const TITLE_GENERATION_PROMPT = [
+  'You will receive the first message of a conversation, or for an ongoing conversation its original request and recent messages.',
+  'Reply with a title for it and nothing else.',
+  'Use the language of the conversation. Use sentence case, not title case.',
+  'Keep it under 50 characters, do not use quotes, and do not end with punctuation.',
+].join(' ');
+
+/**
+ * Ask the engine to generate a title string from the session's own context.
+ *
+ * @param {string} id
+ * @param {string} [directory]
+ * @returns {Promise<string | null>} the raw generated text
+ */
+export async function generateSessionTitleText(id, directory) {
+  if (!engineRegistry.isV2()) return null;
+  const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(id)}/generate`;
+  const headers = { ...getAuthHeader(), 'Content-Type': 'application/json' };
+  if (directory) headers['x-opencode-directory'] = encodeURIComponent(directory);
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ prompt: TITLE_GENERATION_PROMPT }),
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to generate title text: HTTP ${res.status} ${await res.text()}`);
+  }
+  const json = await res.json();
+  const text = json?.data?.text ?? json?.text ?? '';
+  return typeof text === 'string' ? text : '';
+}
+
+/**
+ * Turn generated text into a single title line.
+ *
+ * <p>Models answer with a line, but a stray quote, a markdown bullet or a
+ * trailing period is common; all of it would end up on the tab and in
+ * opencode's session list, so it is normalised here. Returns {@code null} when
+ * nothing usable is left.</p>
+ *
+ * @param {unknown} raw
+ * @returns {string | null}
+ */
+export function sanitizeGeneratedTitle(raw) {
+  if (typeof raw !== 'string') return null;
+  const firstLine = raw.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || '';
+  let cleaned = firstLine
+    .replace(/^```[a-z]*/i, '')
+    .replace(/```$/, '')
+    .replace(/^(?:title|标题)\s*[:：]\s*/i, '')
+    .replace(/^[-*•\d.\s]+/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // Quotes and sentence punctuation nest ("…"。), so peel both until stable.
+  const EDGE = /^["'“”‘’`]+|["'“”‘’`]+$/;
+  const TRAILING = /[\s.;,，。；：:!?！？]+$/;
+  for (let i = 0; i < 4; i += 1) {
+    const next = cleaned.replace(EDGE, '').replace(TRAILING, '').trim();
+    if (next === cleaned) break;
+    cleaned = next;
+  }
+  if (!cleaned) return null;
+  if (isDefaultSessionTitle(cleaned)) return null;
+  return cleaned.length <= 50 ? cleaned : `${cleaned.slice(0, 47)}...`;
 }
 
 /**

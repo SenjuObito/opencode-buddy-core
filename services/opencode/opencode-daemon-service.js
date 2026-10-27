@@ -51,6 +51,7 @@ import {
 import * as serveManager from './opencode-serve-manager.js';
 import * as engineRegistry from './engine-registry.js';
 import * as sdk from './opencode-sdk-client.js';
+import { isDefaultSessionTitle } from './opencode-sdk-client.js';
 import { logInfo, logWarn, logError, logDebug } from '../../utils/logger.js';
 import {
   normalizePermissionRequest,
@@ -97,6 +98,28 @@ const _sseSubPromises = new Map();
 const _activeTurns = new Map();
 /** @type {Map<string, { directory?: string }>} sessionID → session state */
 const _sessions = new Map();
+/**
+ * Last title logged per session. `session.updated` repeats the same title on
+ * every message update; the diagnostic line should only appear when it
+ * changes, so a failing tab can be told apart from a noisy one.
+ *
+ * @type {Map<string, string>}
+ */
+const _lastTitleLogged = new Map();
+const TITLE_LOG_LIMIT = 512;
+/**
+ * Last title *sent* to the host per session. The SSE event and the post-turn
+ * reconcile both deliver the same value; the host must see it once.
+ *
+ * @type {Map<string, string>}
+ */
+const _lastEmittedTitle = new Map();
+/** Sessions already asked to generate a title (one request per session). */
+const _titleRequested = new Set();
+/** Delays for the post-turn title reconcile, which stops on the first hit. */
+const TITLE_RECONCILE_DELAYS_MS = [1200, 4000];
+/** How long to wait for the engine's own generator before falling back. */
+const TITLE_WAIT_DELAYS_MS = [1500, 2500];
 /**
  * Canonical todo state per session.
  *
@@ -646,6 +669,172 @@ function noteUnhandledEventType(type) {
   logDebug('unhandled event type (no case in this build):', type);
 }
 
+/**
+ * Send one session title to the host, exactly once per value.
+ *
+ * <p>The engine's placeholders (`New session - <ISO>`, `Child session - <ISO>`)
+ * are not conversation titles: they are the state in which the engine's own
+ * auto-title generator runs. Forwarding them would paint a raw ISO string on
+ * the tab and then be replaced seconds later, so they are dropped here — the
+ * host keeps its localized placeholder until the engine names the session.</p>
+ *
+ * @param {string} sessionId
+ * @param {unknown} rawTitle
+ */
+function _emitSessionTitle(sessionId, rawTitle) {
+  if (!sessionId || typeof rawTitle !== 'string') return;
+  const title = rawTitle.trim();
+  if (!title) return;
+  if (isDefaultSessionTitle(title)) return;
+  if (_lastEmittedTitle.get(sessionId) === title) return;
+  _lastEmittedTitle.set(sessionId, title);
+  if (_lastEmittedTitle.size > TITLE_LOG_LIMIT) {
+    const oldest = _lastEmittedTitle.keys().next().value;
+    if (oldest !== undefined) _lastEmittedTitle.delete(oldest);
+  }
+  if (_lastTitleLogged.get(sessionId) !== title) {
+    _lastTitleLogged.set(sessionId, title);
+    if (_lastTitleLogged.size > TITLE_LOG_LIMIT) {
+      const oldest = _lastTitleLogged.keys().next().value;
+      if (oldest !== undefined) _lastTitleLogged.delete(oldest);
+    }
+    logInfo('title-event', `session=${sessionId} title="${title}"`);
+  }
+  emitJsonStringMarker('[SESSION_TITLE]', { sessionId, title });
+}
+
+/**
+ * Name a session that has none yet, using the engine only.
+ *
+ * <p>Two engine paths, in order:</p>
+ * <ol>
+ *   <li><b>Engine's own generator.</b> v2 exposes it as
+ *   {@code PATCH /api/session/:id {title: ""}} — the call the engine's TUI
+ *   makes when a title is cleared. When it works the name is stored and
+ *   published by the engine itself.</li>
+ *   <li><b>Engine text generation + store.</b> In opencode 2.1.4 the call
+ *   above answers 204 but produces no title (verified against a bare engine:
+ *   no {@code session.renamed}, no title in the DB, while
+ *   {@code POST /api/session/:id/generate} answers normally on the same
+ *   session). The fallback therefore asks the engine to generate the title
+ *   text with the session's own model and stores the answer as the session
+ *   title. The name is still the engine's, and it lands in the engine, so the
+ *   tab and opencode's own UI show the same title — the plugin never invents
+ *   one from message text.</li>
+ * </ol>
+ *
+ * <p>Called once per session after a successful first turn; a session that is
+ * already named is left alone, so a user rename is never overwritten.</p>
+ *
+ * @param {string} sessionId
+ * @param {string} [directory]
+ */
+async function _ensureEngineTitle(sessionId, directory) {
+  // v1 names a session itself once the first turn exists; asking would be a
+  // wasted round-trip on every turn.
+  if (!sessionId || !engineRegistry.isV2() || _titleRequested.has(sessionId)) return;
+  _titleRequested.add(sessionId);
+  try {
+    if (await _sessionHasRealTitle(sessionId, directory)) return;
+
+    let asked = false;
+    try {
+      asked = await sdk.generateSessionTitle(sessionId, directory);
+    } catch (err) {
+      logDebug('title-request failed:', err?.message || err);
+    }
+    if (asked) {
+      logInfo('title-request', `session=${sessionId} asked the engine to generate a title`);
+      if (await _waitForEngineTitle(sessionId, directory, TITLE_WAIT_DELAYS_MS)) return;
+    }
+
+    const text = await sdk.generateSessionTitleText(sessionId, directory);
+    const title = sdk.sanitizeGeneratedTitle(text);
+    if (!title) {
+      // Let a later turn try again instead of leaving the session permanently
+      // unnamed after one bad generation.
+      _titleRequested.delete(sessionId);
+      logDebug('title-request: engine returned no usable title for', sessionId);
+      return;
+    }
+    await sdk.updateSessionTitle(sessionId, title, directory);
+    logInfo('title-request', `session=${sessionId} named by the engine: "${title}"`);
+    // The engine also publishes `session.renamed`; emitting here means the tab
+    // does not depend on that event arriving.
+    _emitSessionTitle(sessionId, title);
+  } catch (err) {
+    _titleRequested.delete(sessionId);
+    logDebug('title-request failed:', err?.message || err);
+  }
+}
+
+/** @returns {Promise<boolean>} whether the session already carries a real title */
+async function _sessionHasRealTitle(sessionId, directory) {
+  try {
+    const info = await sdk.getSession(sessionId, directory);
+    const title = typeof info?.title === 'string' ? info.title.trim() : '';
+    return !!title && !isDefaultSessionTitle(title);
+  } catch {
+    return false;
+  }
+}
+
+/** @returns {Promise<boolean>} true as soon as the engine stores a real title */
+async function _waitForEngineTitle(sessionId, directory, delays) {
+  for (const delay of delays) {
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, delay);
+      if (typeof timer?.unref === 'function') timer.unref();
+    });
+    if (await _sessionHasRealTitle(sessionId, directory)) return true;
+  }
+  return false;
+}
+
+/**
+ * Re-read the session once after its turn settles and forward a title the SSE
+ * stream did not deliver.
+ *
+ * <p>The engine generates the title asynchronously (a separate small-model
+ * call forked at the first step), so the value can land just after the turn's
+ * terminal event or be lost when the event stream reconnects mid-turn. One
+ * read per settled turn is cheap and, unlike a poll, cannot rename anything:
+ * it only mirrors whatever title the engine already has.</p>
+ *
+ * @param {string} sessionId
+ */
+function _scheduleTitleReconcile(sessionId) {
+  if (!sessionId) return;
+  const directory = _sessions.get(sessionId)?.directory;
+  let attempt = 0;
+  const tick = async () => {
+    let info = null;
+    try {
+      info = await sdk.getSession(sessionId, directory);
+    } catch {
+      info = null;
+    }
+    const title = typeof info?.title === 'string' ? info.title : null;
+    if (title && !isDefaultSessionTitle(title)) {
+      _emitSessionTitle(sessionId, title);
+      return;
+    }
+    attempt += 1;
+    if (attempt < TITLE_RECONCILE_DELAYS_MS.length) {
+      schedule(TITLE_RECONCILE_DELAYS_MS[attempt]);
+    }
+  };
+  const schedule = (delay) => {
+    try {
+      const timer = setTimeout(tick, delay);
+      if (typeof timer?.unref === 'function') timer.unref();
+    } catch {
+      // Timers unavailable (test seam/shutdown): skip the reconcile.
+    }
+  };
+  schedule(TITLE_RECONCILE_DELAYS_MS[0]);
+}
+
 // =============================================================================
 // Subagent lifecycle (v1 `task` / v2 `subagent`)
 // =============================================================================
@@ -1005,12 +1194,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
         }
         // Emit session title update to frontend
         const rawTitle = props?.info?.title || props?.title || props?.name || props?.info?.name;
-        if (rawTitle && typeof rawTitle === 'string') {
-          const title = rawTitle.trim();
-          if (title) {
-            emitJsonStringMarker('[SESSION_TITLE]', { sessionId: id, title });
-          }
-        }
+        _emitSessionTitle(id, rawTitle);
       }
       break;
     }
@@ -1542,6 +1726,12 @@ function _settleTurn(turn, { success, error, reason } = {}) {
   _reconcileSubagentsForParent(turn.sessionId);
   turn.success = success;
   if (success) {
+    // The turn is over, so the engine has the first user message to name the
+    // session from. Fire-and-forget: naming must never delay the turn result.
+    void _ensureEngineTitle(turn.sessionId, _sessions.get(turn.sessionId)?.directory);
+    // The engine may still be finishing the name; make sure the tab sees it
+    // even if the title event was missed.
+    _scheduleTitleReconcile(turn.sessionId);
     turn.resolve({ ok: true });
   } else {
     const errMsg = error instanceof Error ? error.message
