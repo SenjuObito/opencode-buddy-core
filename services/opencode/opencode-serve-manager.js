@@ -502,6 +502,15 @@ async function doStart(port) {
   const spawnEnv = { ...process.env };
   enrichPathWithBinDirs(spawnEnv, commonCliBinDirs(homedir()));
 
+  // Ensure git commands invoked by opencode serve (e.g. Snapshot.revert in v1) output
+  // unquoted UTF-8 paths for non-ASCII/CJK filenames, preventing octal escape mismatches.
+  const existingGitConfig = spawnEnv.GIT_CONFIG_PARAMETERS || '';
+  if (!existingGitConfig.includes('core.quotepath')) {
+    spawnEnv.GIT_CONFIG_PARAMETERS = existingGitConfig
+      ? `${existingGitConfig} 'core.quotepath=false'`
+      : "'core.quotepath=false'";
+  }
+
   const systemNode = probeSystemNode(spawnEnv);
   const cliVersion = _startOptions.cliVersion || probeCliVersion(binary, spawnEnv);
 

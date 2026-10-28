@@ -7,6 +7,7 @@ import {
   listMessages,
   listSessions,
   normalizeDirForMatch,
+  normalizeMessageEntry,
   promptAsync,
   resetClient,
   setBaseUrl,
@@ -489,6 +490,24 @@ test('v2 listMessages preserves compaction message as isCompactSummary', async (
   } finally {
     stub.restore();
   }
+});
+
+test('v1 normalizeMessageEntry normalizes assistant compaction summary', () => {
+  const v1Entry = {
+    info: {
+      id: 'msg_v1_comp',
+      role: 'assistant',
+      mode: 'compaction',
+      agent: 'compaction',
+      summary: true,
+    },
+    parts: [{ type: 'text', text: 'Summary of session' }],
+  };
+  const normalized = normalizeMessageEntry(v1Entry, SESSION_ID);
+  assert.equal(normalized.info.role, 'compaction');
+  assert.equal(normalized.info.isCompactSummary, true);
+  assert.equal(normalized.info.compactMetadata?.trigger, 'manual');
+  assert.equal(normalized.parts[0]?.text, 'Summary of session');
 });
 
 test('v2 shareSession posts to /api/session/{id}/share', async () => {

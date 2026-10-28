@@ -1847,6 +1847,25 @@ export function normalizeMessageEntry(entry, sessionId) {
     }
   }
 
+  // OpenCode v1 compaction normalization: in v1, the compaction summary is an assistant
+  // message with mode='compaction' / agent='compaction' / summary=true. Normalize it to
+  // role='compaction' and isCompactSummary=true to match v2 and host expectations.
+  const isCompaction = info.role === 'compaction'
+    || info.isCompactSummary === true
+    || info.mode === 'compaction'
+    || info.agent === 'compaction'
+    || (info.summary === true && (info.role === 'assistant' || !info.role));
+
+  if (isCompaction) {
+    info.role = 'compaction';
+    info.isCompactSummary = true;
+    if (!info.compactMetadata) {
+      info.compactMetadata = {
+        trigger: info.reason || 'manual',
+      };
+    }
+  }
+
   return { info, parts };
 }
 
@@ -2060,7 +2079,17 @@ export async function listMessages(sessionId, directory, options = {}) {
     throw new Error(`Failed to list messages for session ${sessionId}: ${summarizeError(result.error)}`);
   }
   const entries = Array.isArray(result.data) ? result.data : [];
-  return entries.map((entry) => normalizeMessageEntry(entry, sessionId));
+  return entries
+    .filter((entry) => {
+      const info = entry?.info;
+      const parts = entry?.parts;
+      if (info?.role === 'user' && Array.isArray(parts) && parts.length > 0) {
+        const onlyCompaction = parts.every((p) => p && p.type === 'compaction');
+        if (onlyCompaction) return false;
+      }
+      return true;
+    })
+    .map((entry) => normalizeMessageEntry(entry, sessionId));
 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────
