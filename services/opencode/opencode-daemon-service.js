@@ -1962,8 +1962,14 @@ async function _syncSessionSelection(sessionId, { agent, model, variant }) {
   }
 
   try {
-    if (agent) await sdk.setSessionAgent(sessionId, agent);
+    // Order matters. Switching the model updates the session's runtime model,
+    // but does not rebuild the session system prompt (which contains the model
+    // name). A following agent switch — even to the same agent — rebuilds that
+    // prompt, so the next model self-report/instructions match the new model.
+    // Apply model first, then agent; reversing this leaves the old model name
+    // in the system prompt until the session is recreated.
     if (modelRef) await sdk.setSessionModel(sessionId, modelRef);
+    if (agent) await sdk.setSessionAgent(sessionId, agent);
     _appliedSelections.set(sessionId, key);
     if (_appliedSelections.size > _APPLIED_SELECTION_LIMIT) {
       const oldest = _appliedSelections.keys().next().value;
