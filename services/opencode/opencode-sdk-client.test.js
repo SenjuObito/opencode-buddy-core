@@ -404,6 +404,97 @@ test('v2 listSessions forwards parentID so child sessions are discovered server-
   }
 });
 
+test('v2 listSessions scopes the request to the directory', async () => {
+  lockV2();
+  const stub = stubFetch(() =>
+    jsonResponse({
+      data: [{ id: 'ses_root', location: { directory: '/repo' }, title: 'Root session' }],
+    }),
+  );
+  try {
+    const sessions = await listSessions('/repo');
+    assert.equal(stub.calls.length, 1);
+    assert.match(stub.calls[0].href, /[?&]directory=%2Frepo(?:&|$)/);
+    assert.deepEqual(sessions.map((session) => session.id), ['ses_root']);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v2 listSessions hides subagent child sessions from the history list', async () => {
+  lockV2();
+  const stub = stubFetch(() =>
+    jsonResponse({
+      data: [
+        { id: 'ses_root', location: { directory: '/repo' }, title: 'Root session' },
+        { id: 'ses_child', parentID: 'ses_root', location: { directory: '/repo' }, title: 'Explore repo' },
+        { id: 'ses_grandchild', parentID: 'ses_child', location: { directory: '/repo' }, title: 'Nested child' },
+      ],
+    }),
+  );
+  try {
+    const sessions = await listSessions('/repo');
+    assert.deepEqual(sessions.map((session) => session.id), ['ses_root']);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v2 listSessions recovers a project whose scoped query missed on path spelling', async () => {
+  lockV2();
+  const stub = stubFetch((href) => {
+    if (href.includes('directory=')) {
+      return jsonResponse({ data: [] });
+    }
+    return jsonResponse({
+      data: [
+        { id: 'ses_root', location: { directory: 'd:/source/repos/project-a' }, title: 'Root session' },
+        { id: 'ses_other', location: { directory: 'd:/source/repos/project-b' }, title: 'Other project' },
+      ],
+    });
+  });
+  try {
+    const sessions = await listSessions('D:\\source\\repos\\project-a');
+    assert.equal(stub.calls.length, 2);
+    assert.deepEqual(sessions.map((session) => session.id), ['ses_root']);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v1 listSessions hides subagent child sessions from the history list', async () => {
+  lockV1();
+  const stub = stubFetch(() =>
+    jsonResponse([
+      { id: 'ses_root', directory: '/repo', title: 'Root session' },
+      { id: 'ses_child', parentID: 'ses_root', directory: '/repo', title: 'Explore repo' },
+    ]),
+  );
+  try {
+    const sessions = await listSessions('/repo');
+    assert.deepEqual(sessions.map((session) => session.id), ['ses_root']);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v1 listSessions keeps parentID filtering for child discovery', async () => {
+  lockV1();
+  const stub = stubFetch(() =>
+    jsonResponse([
+      { id: 'ses_root', directory: '/repo', title: 'Root session' },
+      { id: 'ses_child', parentID: 'ses_parent', directory: '/repo', title: 'Explore repo' },
+      { id: 'ses_sibling', parentID: 'ses_other', directory: '/repo', title: 'Another child' },
+    ]),
+  );
+  try {
+    const sessions = await listSessions('/repo', 200, 'ses_parent');
+    assert.deepEqual(sessions.map((session) => session.id), ['ses_child']);
+  } finally {
+    stub.restore();
+  }
+});
+
 test('v2 listSessions unifies location.directory and the model object for the host', async () => {
   lockV2();
   const stub = stubFetch(() =>

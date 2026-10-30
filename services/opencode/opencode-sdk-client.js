@@ -304,6 +304,59 @@ function normalizeSessionSummary(session) {
 }
 
 /**
+ * Keep only the sessions the caller asked for.
+ *
+ * OpenCode persists subagent sidechains as real session rows whose `parentID`
+ * is non-empty. They belong to the parent transcript (the task/subagent tool
+ * part), not to the user-visible history list. The opencode app applies the
+ * same rule (`!session.parentID`) when it derives its root session list.
+ *
+ * `parentID` with a value means "the children of this parent" — the subagent
+ * path uses it to discover a running child session. Without it, only roots.
+ *
+ * @param {object[]} sessions
+ * @param {string} [parentID]
+ * @returns {object[]}
+ */
+function selectSessionSummaries(sessions, parentID) {
+  if (parentID) {
+    return sessions.filter((session) => session && session.parentID === parentID);
+  }
+  return sessions.filter((session) => session && !session.parentID);
+}
+
+/**
+ * One `/api/session` page.
+ *
+ * `directory` is sent as a server-side scope so the page is filled with this
+ * project's sessions instead of the global newest N. The normalized filter in
+ * `listSessions` remains authoritative for path spelling: some v2 builds ignore
+ * the scope, and a strict build can return an empty page when the caller's
+ * path differs from the stored one (Windows drive-letter case / slash).
+ *
+ * @param {{ directory?: string, limit?: number|string, parentID?: string }} options
+ * @returns {Promise<object[]>}
+ */
+async function fetchV2Sessions({ directory, limit, parentID } = {}) {
+  const query = new URLSearchParams();
+  if (limit && Number(limit) > 0) query.set('limit', String(limit));
+  if (directory) query.set('directory', directory);
+  if (parentID) query.set('parentID', parentID);
+  const qs = query.toString();
+  const url = `${getEffectiveBaseUrl()}/api/session${qs ? `?${qs}` : ''}`;
+  const res = await fetch(url, {
+    headers: getAuthHeader(),
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to list sessions: HTTP ${res.status} ${await res.text()}`);
+  }
+  const json = await res.json();
+  return Array.isArray(json.items)
+    ? json.items
+    : (Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []));
+}
+
+/**
  * @param {string} [directory]
  * @param {number|string} [limit]
  * @param {string} [parentID] only sessions spawned by this session
@@ -311,41 +364,29 @@ function normalizeSessionSummary(session) {
  */
 export async function listSessions(directory, limit, parentID) {
   if (engineRegistry.isV2()) {
-    const query = new URLSearchParams();
-    if (limit && Number(limit) > 0) query.set('limit', String(limit));
-    // opencode v2 exposes child sessions through the same list route; the
-    // parentID filter is server-side, so a long history cannot push a child
-    // past the limit before we see it.
-    if (parentID) query.set('parentID', parentID);
-    const qs = query.toString();
-    const url = `${getEffectiveBaseUrl()}/api/session${qs ? `?${qs}` : ''}`;
-    const res = await fetch(url, {
-      headers: getAuthHeader(),
-    });
-    if (!res.ok) {
-      throw new Error(`Failed to list sessions: HTTP ${res.status} ${await res.text()}`);
+    let rawList = await fetchV2Sessions({ directory, limit, parentID });
+    // A scoped query can legitimately return nothing (a brand-new project), but
+    // it can also miss because the server's path spelling differs from ours.
+    // Re-query unscoped only when a scope was requested and came back empty;
+    // the normalized filter below still decides what belongs to the project.
+    if (directory && rawList.length === 0) {
+      rawList = await fetchV2Sessions({ limit, parentID });
     }
-    const json = await res.json();
-    const rawList = Array.isArray(json.items)
-      ? json.items
-      : (Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []));
 
     // Align v1/v2 session objects with the unified host shape.
     const unifiedList = rawList.map(normalizeSessionSummary);
 
     // Robust directory filtering for Windows (case-insensitive & slash-normalized)
-    if (directory && typeof directory === 'string' && directory.trim()) {
-      if (unifiedList.length === 0) return [];
-      const target = normalizeDirForMatch(directory.trim());
-      const filtered = unifiedList.filter(s => {
-        const sessionDir = s.directory;
-        return sessionDir && normalizeDirForMatch(sessionDir) === target;
-      });
-      return filtered;
-    }
+    const scoped = directory && typeof directory === 'string' && directory.trim()
+      ? unifiedList.filter((session) => {
+          const sessionDir = session && session.directory;
+          return sessionDir && normalizeDirForMatch(sessionDir) === normalizeDirForMatch(directory.trim());
+        })
+      : unifiedList;
 
-    return unifiedList;
+    return selectSessionSummaries(scoped, parentID);
   }
+
   const params = {};
   if (limit && Number(limit) > 0) params.limit = Number(limit);
   if (directory) params.directory = directory;
@@ -354,10 +395,9 @@ export async function listSessions(directory, limit, parentID) {
     throw new Error(`Failed to list sessions: ${JSON.stringify(result.error)}`);
   }
   const sessions = (result.data ?? []).map(normalizeSessionSummary);
-  if (!parentID) return sessions;
-  // v1 has no parentID query parameter; filter the result instead. It is the
-  // same contract for callers, and keeps the host free of engine branches.
-  return sessions.filter(session => session && session.parentID === parentID);
+  // v1 has no parentID query parameter; select on the result instead. Same
+  // contract for callers, and the host stays free of engine branches.
+  return selectSessionSummaries(sessions, parentID);
 }
 
 /**
