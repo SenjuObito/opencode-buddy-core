@@ -147,6 +147,102 @@ test('SSE session.renamed emits [SESSION_TITLE] with session identity', () => {
   assert.equal(payload.title, 'New Discussion');
 });
 
+// ── Revert lifecycle (v1 session info + v2 events) ──────────────────────────
+
+function revertPayload(emitted) {
+  const evt = emitted.find((e) => e.line.startsWith('[REVERT_STATE]'));
+  assert.ok(evt, '[REVERT_STATE] must be emitted');
+  const parsed = JSON.parse(evt.line.replace(/^\[REVERT_STATE\]\s*/, ''));
+  return { evt, payload: typeof parsed === 'string' ? JSON.parse(parsed) : parsed };
+}
+
+test('v1 session.updated carries the revert pointer without an active turn', () => {
+  const emitted = captureEmits(() => {
+    _handleEvent({
+      type: 'session.updated',
+      properties: {
+        info: {
+          id: 'ses_revert_v1',
+          revert: { messageID: 'msg_revert_v1' },
+        },
+      },
+      durable: { aggregateID: 'ses_revert_v1', seq: 21 },
+    });
+  });
+
+  const { evt, payload } = revertPayload(emitted);
+  assert.equal(evt.ctx.sessionId, 'ses_revert_v1');
+  assert.deepEqual(payload, { hasRevert: true, messageId: 'msg_revert_v1' });
+});
+
+test('v1 session.updated clears the pointer when info.revert is explicitly null', () => {
+  const emitted = captureEmits(() => {
+    _handleEvent({
+      type: 'session.updated',
+      properties: {
+        info: {
+          id: 'ses_revert_v1_clear',
+          revert: null,
+        },
+      },
+      durable: { aggregateID: 'ses_revert_v1_clear', seq: 22 },
+    });
+  });
+
+  const { evt, payload } = revertPayload(emitted);
+  assert.equal(evt.ctx.sessionId, 'ses_revert_v1_clear');
+  assert.deepEqual(payload, { hasRevert: false, messageId: '' });
+});
+
+test('v2 session.revert.staged emits the new boundary without an active turn', () => {
+  const emitted = captureEmits(() => {
+    _handleEvent({
+      type: 'session.revert.staged',
+      // v2 SSE events use `data`; v1 uses `properties`. Pin the v2 shape here.
+      data: {
+        sessionID: 'ses_revert_v2',
+        revert: { messageID: 'msg_revert_v2' },
+      },
+      durable: { aggregateID: 'ses_revert_v2', seq: 31 },
+    });
+  });
+
+  const { evt, payload } = revertPayload(emitted);
+  assert.equal(evt.ctx.sessionId, 'ses_revert_v2');
+  assert.deepEqual(payload, { hasRevert: true, messageId: 'msg_revert_v2' });
+});
+
+test('v2 session.revert.committed clears the pointer without an active turn', () => {
+  const emitted = captureEmits(() => {
+    _handleEvent({
+      type: 'session.revert.committed',
+      data: {
+        sessionID: 'ses_revert_v2',
+        to: 'msg_revert_v2',
+      },
+      durable: { aggregateID: 'ses_revert_v2', seq: 32 },
+    });
+  });
+
+  const { evt, payload } = revertPayload(emitted);
+  assert.equal(evt.ctx.sessionId, 'ses_revert_v2');
+  assert.deepEqual(payload, { hasRevert: false, messageId: '' });
+});
+
+test('v2 session.revert.cleared clears the pointer on unrevert', () => {
+  const emitted = captureEmits(() => {
+    _handleEvent({
+      type: 'session.revert.cleared',
+      data: { sessionID: 'ses_revert_v2_clear' },
+      durable: { aggregateID: 'ses_revert_v2_clear', seq: 33 },
+    });
+  });
+
+  const { evt, payload } = revertPayload(emitted);
+  assert.equal(evt.ctx.sessionId, 'ses_revert_v2_clear');
+  assert.deepEqual(payload, { hasRevert: false, messageId: '' });
+});
+
 test('SSE delta is attributed to the turn AND gets turnId from durable.seq', () => {
   const turn = _createTurn('7', 'ses_a');
   turn.promise = new Promise(() => {});

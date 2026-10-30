@@ -1165,6 +1165,64 @@ export {
   _reconcileSubagentsForParent,
 };
 
+/**
+ * Normalize the revert payload used by both engines.
+ *
+ * v1 exposes it as `session.info.revert`; v2's lifecycle events carry it under
+ * `session.revert.staged`. The field spelling is `messageID` on the wire, but
+ * accept `messageId`/`message_id` too so a future bridge shape cannot silently
+ * blank the boundary.
+ *
+ * @param {unknown} revert
+ * @returns {{ messageID: string } | null}
+ */
+function _normalizeRevertState(revert) {
+  if (!revert || typeof revert !== 'object') return null;
+  const messageID = typeof revert.messageID === 'string'
+    ? revert.messageID
+    : typeof revert.messageId === 'string'
+      ? revert.messageId
+      : typeof revert.message_id === 'string'
+        ? revert.message_id
+        : '';
+  return { messageID };
+}
+
+/**
+ * Emit the canonical revert-state marker consumed by both hosts.
+ *
+ * This is the only place that serializes revert state, so v1's session-info
+ * path and v2's lifecycle-event path cannot drift in shape.
+ */
+function _emitRevertState(sessionID, revert) {
+  if (!sessionID) return;
+  const state = _normalizeRevertState(revert);
+  emitJsonStringMarker('[REVERT_STATE]', {
+    hasRevert: !!state,
+    messageId: state?.messageID ?? '',
+  });
+}
+
+/**
+ * Resolve the next revert state for a v2 lifecycle event.
+ *
+ * - staged:   a revert pointer now exists
+ * - committed: the next prompt applied the revert cleanup; pointer is gone
+ * - cleared:   unrevert explicitly cleared the pointer
+ *
+ * v1 has no equivalent event family; it keeps reporting through
+ * `session.updated.info.revert`.
+ */
+function _revertStateForLifecycle(type, props) {
+  if (type === 'session.revert.staged') {
+    return _normalizeRevertState(props?.revert ?? props?.info?.revert) ?? { messageID: '' };
+  }
+  if (type === 'session.revert.committed' || type === 'session.revert.cleared') {
+    return null;
+  }
+  return undefined;
+}
+
 function _dispatchInnerEvent(type, props, sessionID, turn) {
   switch (type) {
     case 'session.created':
@@ -1175,29 +1233,46 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       // send/preconnect path itself (authoritative), so we only record state here.
       const id = sessionID || props?.info?.id || props?.id || props?.sessionId;
       if (id) {
-        if (!_sessions.has(id)) {
-          trackSession(id, {
-            directory: props?.info?.directory || props?.directory,
-            revert: props?.info?.revert || props?.revert,
-          });
-        } else {
-          const revert = props?.info?.revert;
-          trackSession(id, {
-            directory: props?.info?.directory || _sessions.get(id)?.directory,
-            revert,
-          });
-        }
-        const revert = props?.info?.revert;
-        if (turn) {
-          emitJsonStringMarker('[REVERT_STATE]', {
-            hasRevert: !!revert,
-            messageId: (revert && typeof revert.messageID === 'string') ? revert.messageID : '',
-          });
+        const info = props?.info;
+        const revert = info?.revert ?? props?.revert;
+        // v1 reports the pointer as part of session info. A present field is
+        // authoritative even outside a turn (history hydration); when the field
+        // is absent, keep both the tracked pointer and the historical
+        // active-turn gate so ordinary session updates cannot erase a live
+        // revert by omission.
+        const hasRevertField = (info && Object.prototype.hasOwnProperty.call(info, 'revert'))
+          || Object.prototype.hasOwnProperty.call(props ?? {}, 'revert');
+        const trackedRevert = hasRevertField
+          ? (_normalizeRevertState(revert) ?? undefined)
+          : _sessions.get(id)?.revert;
+        trackSession(id, {
+          directory: info?.directory || props?.directory || _sessions.get(id)?.directory,
+          revert: trackedRevert,
+        });
+        if (turn || hasRevertField) {
+          _emitRevertState(id, revert);
         }
         // Emit session title update to frontend
-        const rawTitle = props?.info?.title || props?.title || props?.name || props?.info?.name;
+        const rawTitle = info?.title || props?.title || props?.name || info?.name;
         _emitSessionTitle(id, rawTitle);
       }
+      break;
+    }
+    case 'session.revert.staged':
+    case 'session.revert.committed':
+    case 'session.revert.cleared': {
+      // v2 splits revert into lifecycle events. They are authoritative and are
+      // not tied to an active turn: `committed` arrives at the start of the next
+      // prompt, `cleared` on unrevert. Without this branch the host keeps the
+      // old boundary and replays it on the next tab activation.
+      if (!sessionID) break;
+      const next = _revertStateForLifecycle(type, props);
+      const existing = _sessions.get(sessionID);
+      trackSession(sessionID, {
+        directory: existing?.directory,
+        revert: next ?? undefined,
+      });
+      _emitRevertState(sessionID, next);
       break;
     }
     case 'message.part.updated':
