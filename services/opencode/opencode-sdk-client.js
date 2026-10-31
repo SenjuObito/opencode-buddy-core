@@ -195,6 +195,29 @@ export async function health() {
  */
 const DEFAULT_SESSION_TITLE_PREFIX = 'New session - ';
 const CHILD_SESSION_TITLE_PREFIX = 'Child session - ';
+/**
+ * The engine validates `limit <= 200` on `/api/session/{id}/message`; anything
+ * larger is rejected with a 400. Page size is a protocol constant, not a
+ * tuning knob.
+ */
+export const MAX_MESSAGE_PAGE_SIZE = 200;
+
+/** A page with no entries and no cursors (error / empty session). */
+function emptyMessagePage() {
+  return { entries: [], cursor: { previous: null, next: null } };
+}
+
+/** Normalize whatever the endpoint sent as `cursor` into the page shape. */
+function normalizeMessageCursor(raw) {
+  if (!raw || typeof raw !== 'object') {
+    return { previous: null, next: null };
+  }
+  return {
+    previous: typeof raw.previous === 'string' && raw.previous ? raw.previous : null,
+    next: typeof raw.next === 'string' && raw.next ? raw.next : null,
+  };
+}
+
 const DEFAULT_TITLE_PATTERN = new RegExp(
   `^(${DEFAULT_SESSION_TITLE_PREFIX}|${CHILD_SESSION_TITLE_PREFIX})\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$`,
 );
@@ -1909,7 +1932,31 @@ export function normalizeMessageEntry(entry, sessionId) {
   return { info, parts };
 }
 
-export async function listMessages(sessionId, directory, options = {}) {
+/**
+ * One page of a session's transcript, plus the server's pagination cursors.
+ *
+ * <p>opencode 2.x pages `/api/session/{id}/message`: the page size defaults to
+ * 50 when `limit` is omitted and the server rejects anything above 200. A
+ * caller that silently treats the default page as "the whole transcript" shows
+ * a long session truncated to its newest 50 records — which is exactly what the
+ * hosts did before paging was wired through.</p>
+ *
+ * <p>`cursor.previous` / `cursor.next` are opaque strings. Keep the requested
+ * order across pages: the default (no `order`) is newest-first, so `next` walks
+ * towards older messages; `previous` walks back towards newer ones. A cursor
+ * must not be combined with `order` (the server answers 400).</p>
+ *
+ * @param {string} sessionId
+ * @param {string} [directory]
+ * @param {object} [options]
+ * @param {number|string} [options.limit] page size, clamped to 1..200
+ * @param {string} [options.cursor] opaque cursor from a previous page
+ * @param {'asc'|'desc'} [options.order] only valid on the first page
+ * @param {string} [options.type] message type filter, repeated on every page
+ * @param {boolean} [options.tolerateError] resolve to an empty page instead of throwing
+ * @returns {Promise<{ entries: Array<object>, cursor: { previous: string|null, next: string|null } }>}
+ */
+export async function listMessagesPage(sessionId, directory, options = {}) {
   if (engineRegistry.isV2()) {
     // OpenCode REST API routing:
     // The message list lives at /api/session/{id}/message. The bare
@@ -1918,17 +1965,33 @@ export async function listMessages(sessionId, directory, options = {}) {
     // `Unexpected token '<'` — a JSON parse error that says nothing about the
     // real problem (a wrong route). Verified against the server's own
     // /openapi.json route table.
+    const query = [];
+    const requestedLimit = Number(options.limit);
+    if (Number.isFinite(requestedLimit) && requestedLimit > 0) {
+      // The server validates `limit <= 200`; clamping keeps a caller's "give me
+      // everything" from turning into a 400 that reads like a broken route.
+      query.push(`limit=${Math.min(MAX_MESSAGE_PAGE_SIZE, Math.floor(requestedLimit))}`);
+    }
+    if (options.cursor) {
+      query.push(`cursor=${encodeURIComponent(String(options.cursor))}`);
+    } else if (options.order === 'asc' || options.order === 'desc') {
+      // A cursor already carries the order; sending both is a 400.
+      query.push(`order=${options.order}`);
+    }
+    if (options.type) {
+      query.push(`type=${encodeURIComponent(String(options.type))}`);
+    }
     const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/message`
-      + (options.limit && Number(options.limit) > 0 ? `?limit=${Number(options.limit)}` : '');
+      + (query.length > 0 ? `?${query.join('&')}` : '');
     let res;
     try {
       res = await fetch(url, { headers: getAuthHeader() });
     } catch (err) {
-      if (options.tolerateError) return [];
+      if (options.tolerateError) return emptyMessagePage();
       throw new Error(`Failed to list messages for session ${sessionId}: ${err?.message || err}`);
     }
     if (!res.ok) {
-      if (options.tolerateError) return [];
+      if (options.tolerateError) return emptyMessagePage();
       throw new Error(`Failed to list messages for session ${sessionId}: HTTP ${res.status}`);
     }
     // Guard the route, not the payload: an HTML body here always means the SPA
@@ -1937,7 +2000,7 @@ export async function listMessages(sessionId, directory, options = {}) {
     // fail with a syntax error.
     const contentType = res.headers.get('content-type') || '';
     if (!contentType.includes('application/json')) {
-      if (options.tolerateError) return [];
+      if (options.tolerateError) return emptyMessagePage();
       throw new Error(
         `Failed to list messages for session ${sessionId}: ${url} returned `
         + `${contentType.split(';')[0] || 'no content-type'} instead of JSON `
@@ -1950,7 +2013,7 @@ export async function listMessages(sessionId, directory, options = {}) {
     try {
       json = await res.json();
     } catch (err) {
-      if (options.tolerateError) return [];
+      if (options.tolerateError) return emptyMessagePage();
       throw new Error(
         `Failed to list messages for session ${sessionId}: ${url} returned `
         + `unparseable JSON (${err?.message || err})`,
@@ -1959,6 +2022,7 @@ export async function listMessages(sessionId, directory, options = {}) {
     let list = Array.isArray(json.items)
       ? json.items
       : (Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []));
+    const cursor = normalizeMessageCursor(json.cursor);
 
     // OpenCode v2 returns messages in reverse chronological order (newest first).
     // Sort ascending by numerical timestamp to guarantee chronological order (oldest first),
@@ -2107,7 +2171,7 @@ export async function listMessages(sessionId, directory, options = {}) {
       }
       entries.push(normalizeMessageEntry({ info, parts }, sessionId));
     }
-    return entries;
+    return { entries, cursor };
   }
 
   const params = { sessionID: sessionId };
@@ -2115,21 +2179,78 @@ export async function listMessages(sessionId, directory, options = {}) {
   if (options.limit && Number(options.limit) > 0) params.limit = Number(options.limit);
   const result = await getClient().session.messages(params);
   if (result.error) {
-    if (options.tolerateError) return [];
+    if (options.tolerateError) return emptyMessagePage();
     throw new Error(`Failed to list messages for session ${sessionId}: ${summarizeError(result.error)}`);
   }
   const entries = Array.isArray(result.data) ? result.data : [];
-  return entries
-    .filter((entry) => {
-      const info = entry?.info;
-      const parts = entry?.parts;
-      if (info?.role === 'user' && Array.isArray(parts) && parts.length > 0) {
-        const onlyCompaction = parts.every((p) => p && p.type === 'compaction');
-        if (onlyCompaction) return false;
-      }
-      return true;
-    })
-    .map((entry) => normalizeMessageEntry(entry, sessionId));
+  return {
+    entries: entries
+      .filter((entry) => {
+        const info = entry?.info;
+        const parts = entry?.parts;
+        if (info?.role === 'user' && Array.isArray(parts) && parts.length > 0) {
+          const onlyCompaction = parts.every((p) => p && p.type === 'compaction');
+          if (onlyCompaction) return false;
+        }
+        return true;
+      })
+      .map((entry) => normalizeMessageEntry(entry, sessionId)),
+    // The v1 SDK call is unpaginated: it always returns the whole transcript.
+    cursor: { previous: null, next: null },
+  };
+}
+
+/**
+ * The transcript entries of one page (default page size when `limit` is omitted).
+ *
+ * <p>Kept as the array-returning entry point so existing callers — subagent
+ * history, context usage, export — do not change shape. Hosts that need to page
+ * call {@link listMessagesPage} and keep `cursor`.</p>
+ */
+export async function listMessages(sessionId, directory, options = {}) {
+  const page = await listMessagesPage(sessionId, directory, options);
+  return page.entries;
+}
+
+/**
+ * Every message of a session, newest page first, walking `cursor.next`
+ * (older) until the server stops handing out cursors.
+ *
+ * <p>Only for callers that genuinely need the whole transcript (export).
+ * Restoring a session must never do this: a long session is thousands of
+ * records and the host would pay that cost on every tab open.</p>
+ *
+ * @param {string} sessionId
+ * @param {string} [directory]
+ * @param {object} [options] `{ limit, pageLimit }`
+ * @returns {Promise<Array<object>>} entries in chronological order
+ */
+export async function listAllMessages(sessionId, directory, options = {}) {
+  const pageSize = Number(options.limit) > 0 ? Number(options.limit) : MAX_MESSAGE_PAGE_SIZE;
+  const pageLimit = Number(options.pageLimit) > 0 ? Number(options.pageLimit) : 200;
+  const pages = [];
+  let cursor = null;
+  for (let index = 0; index < pageLimit; index += 1) {
+    const page = await listMessagesPage(sessionId, directory, {
+      ...options,
+      limit: pageSize,
+      cursor: cursor || undefined,
+      // `order` must not accompany a cursor; only the first page could carry it.
+      order: cursor ? undefined : options.order,
+    });
+    pages.push(page.entries);
+    cursor = page.cursor.next;
+    if (!cursor || page.entries.length === 0) {
+      break;
+    }
+  }
+  // Pages arrive newest-first, but each page is normalized to chronological
+  // order; walking the pages backwards therefore yields one ascending list.
+  const merged = [];
+  for (let index = pages.length - 1; index >= 0; index -= 1) {
+    merged.push(...pages[index]);
+  }
+  return merged;
 }
 
 // ── Filesystem ───────────────────────────────────────────────────────────
@@ -2139,10 +2260,14 @@ export async function listMessages(sessionId, directory, options = {}) {
  * opencode TUI @-mention 列表同源（服务端 fff 引擎已完成 frecency + 模糊
  * 排序，调用方直接信任顺序）。
  *
+ * The endpoint is a *fuzzy search*: an empty query matches nothing and returns
+ * `[]` by design. Callers that want "list this directory" must use
+ * {@link listFiles} (`/api/fs/list`) instead of relying on a default set here.
+ *
  * @param {object} [options]
- * @param {string} [options.query] search text (empty → default ranked set)
+ * @param {string} [options.query] search text (empty → empty result, not a default set)
  * @param {string} [options.limit] e.g. "20"
- * @param {string} [options.directory] base directory for relative paths
+ * @param {string} [options.directory] project directory the search is scoped to
  * @returns {Promise<Array<{ path: string, type: 'file' | 'directory' }>>}
  */
 export async function findFiles({ query = '', limit = '20', directory } = {}) {
@@ -2150,7 +2275,13 @@ export async function findFiles({ query = '', limit = '20', directory } = {}) {
     try {
       const numLimit = typeof limit === 'number' ? limit : (typeof limit === 'string' ? parseInt(limit, 10) || 20 : 20);
       const url = `${getEffectiveBaseUrl()}/api/fs/find?query=${encodeURIComponent(query || '')}&limit=${numLimit}`;
-      const res = await fetch(url, { headers: getAuthHeader() });
+      // v2 scopes every request by the `x-opencode-directory` header. A
+      // `directory` query parameter is ignored by the server — without the
+      // header every tab/project searched the server's default directory and
+      // the returned relative paths were then resolved against the wrong cwd.
+      const headers = { ...getAuthHeader() };
+      if (directory) headers['x-opencode-directory'] = encodeURIComponent(directory);
+      const res = await fetch(url, { headers });
       if (!res.ok) return [];
       const json = await res.json();
       const list = Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : []);
@@ -2185,6 +2316,87 @@ export async function findFiles({ query = '', limit = '20', directory } = {}) {
     }).filter((e) => Boolean(e.path));
   } catch (err) {
     console.error(`[findFiles] error:`, err);
+    return [];
+  }
+}
+
+/**
+ * Normalize a caller-supplied relative path for `fs.list`.
+ *
+ * The path comes from a webview, so treat it as untrusted: `..` segments and
+ * absolute paths are rejected rather than silently escaping the project root.
+ *
+ * @param {unknown} raw
+ * @returns {string|null} normalized POSIX-style relative path, `''` for the root,
+ *   or `null` when the input must be rejected
+ */
+function normalizeListPath(raw) {
+  const value = typeof raw === 'string' ? raw.replace(/\\/g, '/') : '';
+  const trimmed = value.replace(/^\.\//, '').replace(/\/+$/, '');
+  if (!trimmed) return '';
+  if (trimmed.startsWith('/') || /^[a-zA-Z]:/.test(trimmed)) return null;
+  if (trimmed.split('/').includes('..')) return null;
+  return trimmed;
+}
+
+/**
+ * List one directory level via the server `fs.list` endpoint.
+ *
+ * This is the "navigation" half of @-mention: an empty query and `@dir/` have
+ * no fuzzy search text, and `fs.find` answers `[]` for them. `fs.list` returns
+ * the entries of exactly one directory, relative to `directory`.
+ *
+ * @param {object} [options]
+ * @param {string} [options.path] directory relative to `directory`; `''` = root
+ * @param {string} [options.directory] project directory (sent as `x-opencode-directory`)
+ * @param {number|string} [options.limit] max entries returned (default 200)
+ * @returns {Promise<Array<{ path: string, type: 'file' | 'directory' }>>}
+ */
+export async function listFiles({ path = '', directory, limit = 200 } = {}) {
+  const normalized = normalizeListPath(path);
+  if (normalized === null) {
+    console.error(`[listFiles] rejected unsafe path: ${String(path)}`);
+    return [];
+  }
+  const numLimit = typeof limit === 'number'
+    ? limit
+    : (typeof limit === 'string' ? parseInt(limit, 10) || 200 : 200);
+
+  const mapEntry = (item) => {
+    if (typeof item === 'string') return { path: item, type: 'file' };
+    if (item && typeof item === 'object') {
+      const entryPath = item.path || item.name || '';
+      const type = item.type === 'directory' || item.isDirectory === true ? 'directory' : 'file';
+      return { path: entryPath, type };
+    }
+    return { path: String(item), type: 'file' };
+  };
+
+  if (engineRegistry.isV2()) {
+    const url = `${getEffectiveBaseUrl()}/api/fs/list?path=${encodeURIComponent(normalized)}`;
+    const headers = { ...getAuthHeader() };
+    if (directory) headers['x-opencode-directory'] = encodeURIComponent(directory);
+    const res = await fetch(url, { headers });
+    // A directory that disappeared between two keystrokes is empty, not an error.
+    if (res.status === 404) return [];
+    if (!res.ok) {
+      throw new Error(`fs.list ${res.status} ${res.statusText || ''}`.trim());
+    }
+    const json = await res.json();
+    const list = Array.isArray(json?.data) ? json.data : (Array.isArray(json) ? json : []);
+    return list.map(mapEntry).filter((e) => Boolean(e.path)).slice(0, numLimit);
+  }
+
+  try {
+    const result = await getClient().file.list({
+      path: normalized,
+      directory: directory || undefined,
+    });
+    if (result?.error || !result?.data) return [];
+    const list = Array.isArray(result.data) ? result.data : (result.data?.data || []);
+    return list.map(mapEntry).filter((e) => Boolean(e.path)).slice(0, numLimit);
+  } catch (err) {
+    console.error(`[listFiles] error:`, err);
     return [];
   }
 }

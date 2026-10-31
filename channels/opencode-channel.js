@@ -14,8 +14,10 @@ import {
   replyPermission as openCodeReplyPermission,
   replyQuestion as openCodeReplyQuestion,
   rejectQuestion as openCodeRejectQuestion,
-  listMessages as openCodeListMessages,
+  listMessagesPage as openCodeListMessagesPage,
+  listAllMessages as openCodeListAllMessages,
   findFiles as openCodeFindFiles,
+  listFiles as openCodeListFiles,
   getAgents as openCodeGetAgents,
   getCommands as openCodeGetCommands,
   getMcpStatus as openCodeGetMcpStatus,
@@ -100,23 +102,45 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
       break;
 
     case 'listMessages': {
-      const { sessionId, directory, limit } = stdinData || {};
+      const { sessionId, directory, limit, cursor, order, type, all } = stdinData || {};
       // 冷启动兜底：历史会话恢复依赖 opencode serve 已就绪。preconnect 在插件
       // 启动时预热 serve，但若 preconnect 失败/过慢，首次 listMessages 会打到
       // 冷 serve 导致 getClient().session.messages 失败/返回空，表现为「首次加载
       // 会话消息列表为空、二次及以后正常」。这里显式等待 serve 就绪再查询。
       await ensureServerReady();
       const limitNum = limit ? Number(limit) : 0;
-      const messages = await openCodeListMessages(
-        sessionId || '',
-        directory || undefined,
-        { limit: limitNum > 0 ? limitNum : undefined },
-      );
+      // opencode 2.x 的消息接口是分页的（默认页 50，上限 200）。宿主恢复会话时
+      // 必须显式给 limit 并保留游标，否则「一页」会被当成「全部」。
+      //
+      // `all: true` 只给导出这类确实需要整份 transcript 的调用方：内部走完
+      // cursor，代价随会话长度线性增长，绝不用于打开会话。
+      let entries;
+      let nextCursor = null;
+      let previousCursor = null;
+      if (all === true) {
+        entries = await openCodeListAllMessages(sessionId || '', directory || undefined, {
+          limit: limitNum > 0 ? limitNum : undefined,
+          order: order === 'asc' ? 'asc' : 'desc',
+        });
+      } else {
+        const page = await openCodeListMessagesPage(
+          sessionId || '',
+          directory || undefined,
+          {
+            limit: limitNum > 0 ? limitNum : undefined,
+            cursor: typeof cursor === 'string' && cursor ? cursor : undefined,
+            order: order === 'asc' || order === 'desc' ? order : undefined,
+            type: typeof type === 'string' && type ? type : undefined,
+          },
+        );
+        entries = page.entries;
+        nextCursor = page.cursor.next;
+        previousCursor = page.cursor.previous;
+      }
       // 逐条输出（NDJSON）：此前整包单行 JSON 会被 daemon stdout 拦截器再次
       // stringify（转义膨胀），宿主侧还要 chunks 累积 + join + 全文提取——
       // 长会话恢复时内存峰值放大 5-8 倍。逐条输出每行都是小字符串，宿主
       // ListMessagesCollector 逐行解析只保留 entry 对象。
-      const entries = Array.isArray(messages) ? messages : [];
       console.log(JSON.stringify({
         success: true,
         provider: 'opencode',
@@ -138,6 +162,11 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
         sessionId: sessionId || '',
         messagesDone: true,
         count: entries.length,
+        // 默认顺序（不传 order）为「新→旧」，`nextCursor` 指向更早的一页；
+        // 宿主据此判断 hasEarlier 并续页，不需要自己猜顺序。
+        nextCursor,
+        previousCursor,
+        hasEarlier: Boolean(nextCursor),
       }));
       break;
     }
@@ -216,6 +245,32 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
         }));
       } catch (err) {
         console.error(`[DEBUG][OpenCodeFindFiles] failed: ${err?.message || err}`);
+        throw err;
+      }
+      break;
+    }
+
+    case 'listFiles': {
+      // @ 目录导航：空 query / `@dir/` 没有模糊文本，`fs.find` 对空串返回空集，
+      // 所以目录候选走服务端 `fs.list`（一次一层，相对 directory）。
+      const { path, directory } = stdinData || {};
+      try {
+        await ensureServerReady();
+        const entries = await openCodeListFiles({
+          path: typeof path === 'string' ? path : '',
+          directory: directory || undefined,
+          limit: 200,
+        });
+        console.error(
+          `[DEBUG][OpenCodeListFiles] path="${path || ''}" directory=${directory || '-'} entries=${entries.length}`,
+        );
+        console.log(JSON.stringify({
+          success: true,
+          provider: 'opencode',
+          entries: Array.isArray(entries) ? entries : [],
+        }));
+      } catch (err) {
+        console.error(`[DEBUG][OpenCodeListFiles] failed: ${err?.message || err}`);
         throw err;
       }
       break;
@@ -417,6 +472,6 @@ export function getOpenCodeCommandList() {
     'send', 'listModels', 'listMessages', 'getSubagentHistory', 'getSessionSubagents', 'getSessionInfo', 'listAgents', 'listCommands',
     'listMcpServers', 'getMcpStatus', 'replyPermission', 'replyQuestion', 'rejectQuestion',
     'shareSession', 'unshareSession', 'revert', 'unrevert', 'fork', 'summarize',
-    'findFiles', 'listSessions', 'deleteSession', 'updateSessionTitle', 'toggleFavorite',
+    'findFiles', 'listFiles', 'listSessions', 'deleteSession', 'updateSessionTitle', 'toggleFavorite',
   ];
 }

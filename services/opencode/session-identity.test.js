@@ -470,3 +470,117 @@ test('session.status:retry with free_tier_limit immediately settles the active t
   }
 });
 
+test('v2 SSE compaction events emit [COMPACTION_STARTED], [COMPACTION_DELTA], [COMPACTION_ENDED]', () => {
+  const emitted = captureEmits(() => {
+    _handleEvent({
+      type: 'session.next.compaction.started',
+      properties: {
+        sessionID: 'ses_compact_auto',
+        messageID: 'msg_cmp_1',
+        reason: 'auto',
+      },
+    });
+    _handleEvent({
+      type: 'session.next.compaction.delta',
+      properties: {
+        sessionID: 'ses_compact_auto',
+        text: 'Summary chunk 1',
+      },
+    });
+    _handleEvent({
+      type: 'session.next.compaction.ended',
+      properties: {
+        sessionID: 'ses_compact_auto',
+        text: 'Full auto summary',
+        reason: 'auto',
+        tokens: { input: 1000, output: 100 },
+      },
+    });
+  });
+
+  const started = emitted.find((e) => e.line.startsWith('[COMPACTION_STARTED]'));
+  assert.ok(started, '[COMPACTION_STARTED] must be emitted');
+  const startedPayload = JSON.parse(started.line.substring('[COMPACTION_STARTED]'.length).trim());
+  assert.equal(startedPayload.sessionID, 'ses_compact_auto');
+  assert.equal(startedPayload.reason, 'auto');
+
+  const delta = emitted.find((e) => e.line.startsWith('[COMPACTION_DELTA]'));
+  assert.ok(delta, '[COMPACTION_DELTA] must be emitted');
+  const deltaPayload = JSON.parse(delta.line.substring('[COMPACTION_DELTA]'.length).trim());
+  assert.equal(deltaPayload.sessionID, 'ses_compact_auto');
+  assert.equal(deltaPayload.text, 'Summary chunk 1');
+
+  const ended = emitted.find((e) => e.line.startsWith('[COMPACTION_ENDED]'));
+  assert.ok(ended, '[COMPACTION_ENDED] must be emitted');
+  const endedPayload = JSON.parse(ended.line.substring('[COMPACTION_ENDED]'.length).trim());
+  assert.equal(endedPayload.sessionID, 'ses_compact_auto');
+  assert.equal(endedPayload.summary, 'Full auto summary');
+  assert.equal(endedPayload.reason, 'auto');
+  assert.equal(endedPayload.tokens.input, 1000);
+
+  const compatResult = emitted.find((e) => e.line.startsWith('[SESSION_COMPACT_RESULT]'));
+  assert.ok(compatResult, '[SESSION_COMPACT_RESULT] must also be emitted for backward compatibility');
+});
+
+test('v1 compaction turn intercepts content delta as [COMPACTION_DELTA] and settles with [COMPACTION_ENDED]', () => {
+  const turn = {
+    sessionId: 'ses_v1_compact',
+    requestId: 'req_v1',
+    turnId: 101,
+    settled: false,
+    parts: new Map(),
+    assistantMessagesMap: new Map(),
+    resolve: () => {},
+    reject: () => {},
+  };
+  _activeTurns.set('ses_v1_compact', turn);
+
+  try {
+    const emitted = captureEmits(() => {
+      // 1. message.updated with mode: 'compaction'
+      _handleEvent({
+        type: 'message.updated',
+        properties: {
+          sessionID: 'ses_v1_compact',
+          info: {
+            id: 'msg_v1_cmp',
+            mode: 'compaction',
+            role: 'assistant',
+          },
+        },
+      });
+
+      // 2. session.text.delta should become [COMPACTION_DELTA], not [CONTENT_DELTA]
+      _handleEvent({
+        type: 'session.text.delta',
+        properties: {
+          sessionID: 'ses_v1_compact',
+          delta: 'V1 summary part',
+        },
+      });
+
+      // 3. Turn ends
+      _settleTurn(turn, { success: true });
+    });
+
+    const started = emitted.find((e) => e.line.startsWith('[COMPACTION_STARTED]'));
+    assert.ok(started, '[COMPACTION_STARTED] must be emitted for v1 compaction message');
+
+    const contentDelta = emitted.find((e) => e.line.startsWith('[CONTENT_DELTA]'));
+    assert.equal(contentDelta, undefined, '[CONTENT_DELTA] must NOT be emitted during compaction');
+
+    const compDelta = emitted.find((e) => e.line.startsWith('[COMPACTION_DELTA]'));
+    assert.ok(compDelta, '[COMPACTION_DELTA] must be emitted instead');
+    const compDeltaPayload = JSON.parse(compDelta.line.substring('[COMPACTION_DELTA]'.length).trim());
+    assert.equal(compDeltaPayload.text, 'V1 summary part');
+
+    const ended = emitted.find((e) => e.line.startsWith('[COMPACTION_ENDED]'));
+    assert.ok(ended, '[COMPACTION_ENDED] must be emitted upon turn settle');
+    const endedPayload = JSON.parse(ended.line.substring('[COMPACTION_ENDED]'.length).trim());
+    assert.equal(endedPayload.summary, 'V1 summary part');
+  } finally {
+    _activeTurns.delete('ses_v1_compact');
+  }
+});
+
+

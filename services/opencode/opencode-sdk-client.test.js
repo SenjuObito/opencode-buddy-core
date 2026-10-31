@@ -3,8 +3,12 @@ import assert from 'node:assert/strict';
 import * as registry from './engine-registry.js';
 import {
   createSession,
+  findFiles,
   getAgents,
+  listFiles,
   listMessages,
+  listMessagesPage,
+  listAllMessages,
   listSessions,
   normalizeDirForMatch,
   normalizeMessageEntry,
@@ -763,3 +767,144 @@ test('v2 summarizeSession rejects when compaction fails in background', async ()
   }
 });
 
+
+/**
+ * `@` file candidates: `fs.list` is the navigation half, `fs.find` the search
+ * half. `fs.find("")` is a fuzzy search with nothing to match and answers `[]`,
+ * which is exactly the bug that made typing `@` show no files at all.
+ */
+
+test('v2 listFiles requests /api/fs/list with the path and the directory header', async () => {
+  lockV2();
+  const stub = stubFetch(() =>
+    jsonResponse({ data: [{ path: 'src\\host\\', type: 'directory' }, { name: 'README.md' }] }),
+  );
+  try {
+    const entries = await listFiles({ path: 'src', directory: '/repo' });
+    assert.equal(stub.calls.length, 1);
+    assert.equal(stub.calls[0].path, '/api/fs/list');
+    assert.equal(stub.calls[0].href.includes('path=src'), true);
+    // Only the header scopes the request; a `directory` query parameter is ignored.
+    assert.equal(stub.calls[0].init.headers['x-opencode-directory'], encodeURIComponent('/repo'));
+    assert.deepEqual(entries, [
+      { path: 'src\\host\\', type: 'directory' },
+      { path: 'README.md', type: 'file' },
+    ]);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v2 listFiles asks for the project root with an empty path', async () => {
+  lockV2();
+  const stub = stubFetch(() => jsonResponse({ data: [{ path: 'package.json', type: 'file' }] }));
+  try {
+    await listFiles({ path: '', directory: '/repo' });
+    assert.equal(stub.calls[0].path, '/api/fs/list');
+    assert.equal(stub.calls[0].href.endsWith('/api/fs/list?path='), true);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v2 listFiles never lets a webview path escape the project', async () => {
+  lockV2();
+  const stub = stubFetch(() => jsonResponse({ data: [{ path: 'secret', type: 'file' }] }));
+  try {
+    assert.deepEqual(await listFiles({ path: '../../etc', directory: '/repo' }), []);
+    assert.deepEqual(await listFiles({ path: 'C:\\Windows', directory: '/repo' }), []);
+    assert.equal(stub.calls.length, 0, 'unsafe paths must not reach the server');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v2 listFiles treats a vanished directory as empty, not as an error', async () => {
+  lockV2();
+  const stub = stubFetch(() => jsonResponse({ error: 'not found' }, 404));
+  try {
+    assert.deepEqual(await listFiles({ path: 'gone', directory: '/repo' }), []);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v2 findFiles scopes the fuzzy search to the directory header', async () => {
+  lockV2();
+  const stub = stubFetch(() => jsonResponse({ data: [{ path: 'src/host/FileHandler.ts', type: 'file' }] }));
+  try {
+    const entries = await findFiles({ query: 'src/ho', directory: '/repo' });
+    assert.equal(stub.calls[0].path, '/api/fs/find');
+    assert.equal(stub.calls[0].href.includes('query=src%2Fho'), true);
+    // Without the header the engine searches its own cwd and the relative paths
+    // are resolved against the wrong project.
+    assert.equal(stub.calls[0].init.headers['x-opencode-directory'], encodeURIComponent('/repo'));
+    assert.deepEqual(entries, [{ path: 'src/host/FileHandler.ts', type: 'file' }]);
+  } finally {
+    stub.restore();
+  }
+});
+
+// ── Transcript pagination (the endpoint pages; default page is 50) ────────
+
+test('v2 listMessagesPage forwards the page size and returns the server cursor', async () => {
+  lockV2();
+  const stub = stubFetch(() => jsonResponse({
+    data: [{ info: { id: 'msg_1', role: 'assistant', time: { created: 100 } }, parts: [] }],
+    cursor: { previous: 'CUR_PREV', next: 'CUR_NEXT' },
+  }));
+  try {
+    const page = await listMessagesPage(SESSION_ID, '/repo', { limit: 200 });
+    assert.equal(new URL(stub.calls[0].href).searchParams.get('limit'), '200');
+    assert.equal(page.entries.length, 1);
+    assert.deepEqual(page.cursor, { previous: 'CUR_PREV', next: 'CUR_NEXT' });
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v2 listMessagesPage clamps limit to the server max and never sends cursor with order', async () => {
+  lockV2();
+  const stub = stubFetch(() => jsonResponse({ data: [], cursor: { previous: null, next: null } }));
+  try {
+    await listMessagesPage(SESSION_ID, undefined, { limit: 5000 });
+    await listMessagesPage(SESSION_ID, undefined, { cursor: 'CUR', order: 'desc', type: 'user' });
+    const first = new URL(stub.calls[0].href);
+    const second = new URL(stub.calls[1].href);
+    // >200 is a 400 on this route; the client must clamp instead of failing.
+    assert.equal(first.searchParams.get('limit'), '200');
+    assert.equal(second.searchParams.get('cursor'), 'CUR');
+    // cursor + order is rejected by the server; the cursor owns the order.
+    assert.equal(second.searchParams.get('order'), null);
+    assert.equal(second.searchParams.get('type'), 'user');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('listAllMessages walks every cursor and returns one chronological list', async () => {
+  lockV2();
+  const pages = [
+    {
+      data: [
+        { info: { id: 'msg_3', role: 'assistant', time: { created: 300 } }, parts: [] },
+        { info: { id: 'msg_2', role: 'assistant', time: { created: 200 } }, parts: [] },
+      ],
+      cursor: { previous: null, next: 'CUR_2' },
+    },
+    {
+      data: [{ info: { id: 'msg_1', role: 'user', time: { created: 100 } }, parts: [] }],
+      cursor: { previous: 'CUR_PREV', next: null },
+    },
+  ];
+  let index = 0;
+  const stub = stubFetch(() => jsonResponse(pages[index++]));
+  try {
+    const all = await listAllMessages(SESSION_ID, undefined, { limit: 200 });
+    assert.deepEqual(all.map((entry) => entry.info.id), ['msg_1', 'msg_2', 'msg_3']);
+    assert.equal(stub.calls.length, 2);
+    assert.equal(new URL(stub.calls[1].href).searchParams.get('cursor'), 'CUR_2');
+  } finally {
+    stub.restore();
+  }
+});

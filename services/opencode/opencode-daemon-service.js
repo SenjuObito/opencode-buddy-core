@@ -1288,11 +1288,25 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     case 'message.updated': {
       // Track assistant message info (id/role/tokens/cost) for MESSAGE_END and turn usage aggregation.
       if (turn && props?.info && typeof props.info === 'object') {
-        const isAssistant = props.info.role === 'assistant' || props.info.type === 'assistant';
-        if (isAssistant) {
-          turn.lastInfo = props.info;
-          if (props.info.id) {
-            turn.assistantMessagesMap.set(props.info.id, props.info);
+        const info = props.info;
+        const isCompaction = info.role === 'compaction'
+          || info.mode === 'compaction'
+          || info.agent === 'compaction'
+          || info.isCompactSummary === true;
+        if (isCompaction && !turn.isCompaction) {
+          turn.isCompaction = true;
+          turn.compactionSummary = '';
+          emitJsonStringMarker('[COMPACTION_STARTED]', {
+            sessionID: sessionID || turn.sessionId,
+            messageID: info.id || '',
+            reason: info.reason || 'auto',
+          });
+        }
+        const isAssistant = info.role === 'assistant' || info.type === 'assistant';
+        if (isAssistant && !isCompaction) {
+          turn.lastInfo = info;
+          if (info.id) {
+            turn.assistantMessagesMap.set(info.id, info);
           }
         }
       }
@@ -1326,7 +1340,15 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       break;
     case 'session.text.delta':
       if (turn && typeof props?.delta === 'string' && props.delta) {
-        emitJsonStringMarker('[CONTENT_DELTA]', props.delta);
+        if (turn.isCompaction) {
+          turn.compactionSummary = (turn.compactionSummary || '') + props.delta;
+          emitJsonStringMarker('[COMPACTION_DELTA]', {
+            sessionID: sessionID || turn.sessionId,
+            text: props.delta,
+          });
+        } else {
+          emitJsonStringMarker('[CONTENT_DELTA]', props.delta);
+        }
       }
       break;
     case 'session.step.ended': {
@@ -1538,6 +1560,17 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       // immediately even if the later listMessages snapshot is delayed or lost.
       const raw = props?.error || props?.data?.error || { message: type };
       const normalized = sdk.normalizeProviderError(raw, 'error');
+      // A user-initiated stop is not a failure. The server reports it through
+      // this same event (`error.type: 'aborted'`, message "Step interrupted"),
+      // and forwarding it as [TURN_ERROR] made the host paint an error row the
+      // user never asked for. The abort path already closes the stream and
+      // emits `[TURN_END] reason=aborted`; nothing else is needed here.
+      if (turn?.aborted
+          || normalized?.kind === 'aborted'
+          || /^(step|user) interrupted$/i.test(normalized?.message || '')) {
+        logDebug('step failed after abort — [TURN_ERROR] suppressed:', sessionID || '-');
+        break;
+      }
       if (normalized) {
         emitJsonStringMarker('[TURN_ERROR]', {
           sessionID: sessionID || '',
@@ -1553,8 +1586,17 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       // 压缩完成信号。压缩不是 turn（无 active turn / done 信号可达 UI），
       // 必须经 marker 越权上报，宿主才能把结果送到对话列表。
       const compactSessionID = sessionID || props?.info?.id || props?.data?.sessionID || props?.sessionID || '';
-      logDebug('session.compacted / compaction.ended:', compactSessionID);
+      const summary = props?.text || props?.summary || props?.data?.text || props?.data?.summary || '';
+      const reason = props?.reason || props?.data?.reason || 'auto';
+      logDebug('session.compacted / compaction.ended:', compactSessionID, 'summaryLength:', summary.length);
       resolvePendingCompaction(compactSessionID, true);
+      emitJsonStringMarker('[COMPACTION_ENDED]', {
+        sessionID: compactSessionID,
+        summary,
+        reason,
+        tokens: props?.tokens || props?.data?.tokens,
+        recent: props?.recent || props?.data?.recent,
+      });
       emitJsonStringMarker('[SESSION_COMPACT_RESULT]', JSON.stringify({
         sessionID: compactSessionID,
         success: true,
@@ -1563,11 +1605,29 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     }
     case 'session.compaction.started':
     case 'session.next.compaction.started':
-    case 'session.next.compaction.started.1':
+    case 'session.next.compaction.started.1': {
+      const compactSessionID = sessionID || props?.data?.sessionID || props?.sessionID || props?.info?.id || '';
+      const messageID = props?.messageID || props?.data?.messageID || '';
+      const reason = props?.reason || props?.data?.reason || 'auto';
+      logDebug(`${type}:`, compactSessionID, reason);
+      emitJsonStringMarker('[COMPACTION_STARTED]', {
+        sessionID: compactSessionID,
+        messageID,
+        reason,
+      });
+      break;
+    }
     case 'session.compaction.delta':
     case 'session.next.compaction.delta': {
       const compactSessionID = sessionID || props?.data?.sessionID || props?.sessionID || '';
-      logDebug(`${type}:`, compactSessionID);
+      const text = typeof props?.text === 'string' ? props.text : (typeof props?.delta === 'string' ? props.delta : '');
+      logDebug(`${type}:`, compactSessionID, 'deltaLength:', text.length);
+      if (text) {
+        emitJsonStringMarker('[COMPACTION_DELTA]', {
+          sessionID: compactSessionID,
+          text,
+        });
+      }
       break;
     }
     case 'session.compaction.failed':
@@ -1587,6 +1647,10 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
         const compactSessionID = sessionID || props?.info?.id || props?.data?.sessionID || props?.sessionID || '';
         logDebug(`${type} (compaction / no turn):`, compactSessionID, JSON.stringify(err).substring(0, 200));
         resolvePendingCompaction(compactSessionID, false, err?.message || String(err));
+        emitJsonStringMarker('[COMPACTION_FAILED]', {
+          sessionID: compactSessionID,
+          error: err?.message || String(err),
+        });
         emitJsonStringMarker('[SESSION_COMPACT_RESULT]', JSON.stringify({
           sessionID: compactSessionID,
           success: false,
@@ -1700,7 +1764,15 @@ function _handlePartDelta(props, turn) {
   if (ptype === 'reasoning') {
     emitJsonStringMarker('[THINKING_DELTA]', delta);
   } else if (ptype === 'text' || !ptype) {
-    emitJsonStringMarker('[CONTENT_DELTA]', delta);
+    if (turn?.isCompaction) {
+      turn.compactionSummary = (turn.compactionSummary || '') + delta;
+      emitJsonStringMarker('[COMPACTION_DELTA]', {
+        sessionID: turn.sessionId,
+        text: delta,
+      });
+    } else {
+      emitJsonStringMarker('[CONTENT_DELTA]', delta);
+    }
   }
 }
 
@@ -1809,6 +1881,14 @@ function _settleTurn(turn, { success, error, reason } = {}) {
   if (turn.settled) return;
   turn.settled = true;
   turn.settleReason = reason || (success ? 'idle' : 'error');
+  if (turn.isCompaction) {
+    emitJsonStringMarker('[COMPACTION_ENDED]', {
+      sessionID: turn.sessionId,
+      summary: turn.compactionSummary || '',
+      reason: 'auto',
+    });
+    turn.isCompaction = false;
+  }
   // Tool-part reconciliation can emit `[MESSAGE]` blocks, including on the
   // watchdog path where there is no ambient identity — so give it one.
   runWithIdentity(
@@ -2254,9 +2334,12 @@ export async function sendMessagePersistent(params = {}) {
   } catch (err) {
     if (turn.aborted) {
       // Graceful abort — clean "interrupted" result, no error toast.
+      // `aborted: true` is the machine-readable signal the host uses to skip
+      // its error path; there is deliberately no `error` string here, because
+      // any consumer that sees one would render it as a failure.
       endStream({ sessionId });
       _emitTurnEndOnce(turn, 'aborted');
-      console.log(JSON.stringify({ success: false, error: 'User interrupted', elapsedMs: Date.now() - startedAt }));
+      console.log(JSON.stringify({ success: false, aborted: true, elapsedMs: Date.now() - startedAt }));
       return;
     }
     endStream({ sessionId });
@@ -2370,7 +2453,7 @@ export async function sendShellPersistent(params = {}) {
     if (turn.aborted) {
       endStream({ sessionId });
       _emitTurnEndOnce(turn, 'aborted');
-      console.log(JSON.stringify({ success: false, error: 'User interrupted', elapsedMs: Date.now() - startedAt }));
+      console.log(JSON.stringify({ success: false, aborted: true, elapsedMs: Date.now() - startedAt }));
       return;
     }
     endStream({ sessionId });

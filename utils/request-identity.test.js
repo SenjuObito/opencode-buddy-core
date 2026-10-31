@@ -35,6 +35,7 @@ test('isTurnCommand recognises only send/shell across provider prefixes', () => 
     'opencode.rejectQuestion',
     'opencode.listModels',
     'opencode.findFiles',
+    'opencode.listFiles',
     'opencode.abort',
   ]) {
     assert.equal(isTurnCommand(method), false, `${method} must not be a turn command`);
