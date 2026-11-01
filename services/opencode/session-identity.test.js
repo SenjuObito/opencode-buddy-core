@@ -11,6 +11,7 @@ import {
 } from '../../request-context.js';
 import * as registry from './engine-registry.js';
 import { setBaseUrl, resetClient } from './opencode-sdk-client.js';
+import { markManualCompaction, clearManualCompaction } from './compaction-tracker.js';
 import {
   _handleEvent,
   _activeTurns,
@@ -520,6 +521,99 @@ test('v2 SSE compaction events emit [COMPACTION_STARTED], [COMPACTION_DELTA], [C
 
   const compatResult = emitted.find((e) => e.line.startsWith('[SESSION_COMPACT_RESULT]'));
   assert.ok(compatResult, '[SESSION_COMPACT_RESULT] must also be emitted for backward compatibility');
+});
+
+test('a manual /compact is reported as reason=manual even when the engine says auto', () => {
+  markManualCompaction('ses_compact_manual');
+  try {
+    const emitted = captureEmits(() => {
+      _handleEvent({
+        type: 'session.next.compaction.started',
+        properties: {
+          sessionID: 'ses_compact_manual',
+          messageID: 'msg_cmp_manual',
+          reason: 'auto',
+        },
+      });
+      _handleEvent({
+        type: 'session.next.compaction.ended',
+        properties: {
+          sessionID: 'ses_compact_manual',
+          text: 'Manual summary',
+          reason: 'auto',
+        },
+      });
+      // The mark is consumed by the terminal event; a later engine compaction
+      // must not inherit it.
+      _handleEvent({
+        type: 'session.next.compaction.started',
+        properties: {
+          sessionID: 'ses_compact_manual',
+          messageID: 'msg_cmp_auto',
+          reason: 'auto',
+        },
+      });
+    });
+
+    const startedPayloads = emitted
+      .filter((e) => e.line.startsWith('[COMPACTION_STARTED]'))
+      .map((e) => JSON.parse(e.line.substring('[COMPACTION_STARTED]'.length).trim()));
+    assert.equal(startedPayloads[0].reason, 'manual');
+    assert.equal(startedPayloads[1].reason, 'auto', 'the manual mark must be cleared by the terminal event');
+
+    const ended = emitted.find((e) => e.line.startsWith('[COMPACTION_ENDED]'));
+    assert.ok(ended);
+    assert.equal(
+      JSON.parse(ended.line.substring('[COMPACTION_ENDED]'.length).trim()).reason,
+      'manual',
+    );
+  } finally {
+    clearManualCompaction('ses_compact_manual');
+  }
+});
+
+test('a manual mark outlives a v1 turn and settles as manual', () => {
+  const turn = {
+    sessionId: 'ses_v1_manual',
+    requestId: 'req_v1_manual',
+    turnId: 102,
+    settled: false,
+    parts: new Map(),
+    assistantMessagesMap: new Map(),
+    resolve: () => {},
+    reject: () => {},
+  };
+  _activeTurns.set('ses_v1_manual', turn);
+  markManualCompaction('ses_v1_manual');
+
+  try {
+    const emitted = captureEmits(() => {
+      _handleEvent({
+        type: 'message.updated',
+        properties: {
+          sessionID: 'ses_v1_manual',
+          info: { id: 'msg_v1_manual_cmp', mode: 'compaction', role: 'assistant' },
+        },
+      });
+      _settleTurn(turn, { success: true });
+    });
+
+    const started = emitted.find((e) => e.line.startsWith('[COMPACTION_STARTED]'));
+    assert.ok(started);
+    assert.equal(
+      JSON.parse(started.line.substring('[COMPACTION_STARTED]'.length).trim()).reason,
+      'manual',
+    );
+    const ended = emitted.find((e) => e.line.startsWith('[COMPACTION_ENDED]'));
+    assert.ok(ended);
+    assert.equal(
+      JSON.parse(ended.line.substring('[COMPACTION_ENDED]'.length).trim()).reason,
+      'manual',
+    );
+  } finally {
+    _activeTurns.delete('ses_v1_manual');
+    clearManualCompaction('ses_v1_manual');
+  }
 });
 
 test('v1 compaction turn intercepts content delta as [COMPACTION_DELTA] and settles with [COMPACTION_ENDED]', () => {

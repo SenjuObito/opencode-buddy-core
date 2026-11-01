@@ -22,7 +22,7 @@
 import { createOpencodeClient } from '@opencode-ai/sdk/v2';
 import * as serveManager from './opencode-serve-manager.js';
 import * as engineRegistry from './engine-registry.js';
-import { registerPendingCompaction, resolvePendingCompaction } from './compaction-tracker.js';
+import { registerPendingCompaction, resolvePendingCompaction, markManualCompaction, clearManualCompaction } from './compaction-tracker.js';
 
 let _client = null;
 let _baseUrl = null;
@@ -1027,6 +1027,10 @@ export async function abort(sessionId, directory) {
  * @returns {Promise<void>}
  */
 export async function summarizeSession(sessionId, directory, model) {
+  // Mark first: the engine starts the compaction before this call returns, and
+  // its SSE payloads cannot say whether the trigger was the user or the context
+  // window. Everything below runs under that mark until ended/failed clears it.
+  markManualCompaction(sessionId);
   if (engineRegistry.isV2()) {
     const url = `${getEffectiveBaseUrl()}/api/session/${encodeURIComponent(sessionId)}/compact`;
     const waitPromise = registerPendingCompaction(sessionId, 60000);
@@ -1039,20 +1043,31 @@ export async function summarizeSession(sessionId, directory, model) {
       });
     } catch (err) {
       resolvePendingCompaction(sessionId, false, err?.message || String(err));
+      clearManualCompaction(sessionId);
       throw err;
     }
     if (!res.ok) {
       const errText = await res.text();
       resolvePendingCompaction(sessionId, false, `HTTP ${res.status}: ${errText}`);
+      clearManualCompaction(sessionId);
       throw new Error(`Summarize failed: HTTP ${res.status} ${errText}`);
     }
-    await waitPromise;
+    try {
+      await waitPromise;
+    } catch (err) {
+      // A timeout or a failure the SSE stream never reported: the mark must not
+      // outlive the request.
+      clearManualCompaction(sessionId);
+      throw err;
+    }
+    clearManualCompaction(sessionId);
     return;
   }
 
   const resolved = await resolveSummarizeModel(model, sessionId, directory);
   console.error(`[summarize] model resolved: ${resolved ? `${resolved.providerID}/${resolved.modelID}` : 'FAILED (null)'}`);
   if (!resolved) {
+    clearManualCompaction(sessionId);
     throw new Error('Summarize failed: cannot resolve model for session');
   }
   const params = { sessionID: sessionId };
@@ -1062,11 +1077,21 @@ export async function summarizeSession(sessionId, directory, model) {
   params.modelID = resolved.modelID;
   console.error(`[summarize] POST /session/${sessionId}/summarize — waiting for LLM completion...`);
   const startedAt = Date.now();
-  const result = await getClient().session.summarize(params);
+  let result;
+  try {
+    result = await getClient().session.summarize(params);
+  } catch (err) {
+    clearManualCompaction(sessionId);
+    throw err;
+  }
   console.error(`[summarize] HTTP returned after ${Date.now() - startedAt}ms, error=${result.error ? JSON.stringify(result.error) : 'none'}`);
   if (result.error) {
+    clearManualCompaction(sessionId);
     throw new Error(`Summarize failed: ${JSON.stringify(result.error)}`);
   }
+  // The turn may settle after this returns; `turn.compactionReason` already
+  // carries the trigger, so the mark can go now instead of lingering until TTL.
+  clearManualCompaction(sessionId);
 }
 
 /**

@@ -57,7 +57,7 @@ import {
   normalizePermissionRequest,
   normalizeQuestionRequest,
 } from './event-normalize.js';
-import { resolvePendingCompaction } from './compaction-tracker.js';
+import { resolvePendingCompaction, compactionReasonFor, clearManualCompaction } from './compaction-tracker.js';
 import { getSubagentHistory } from './subagent-service.js';
 import {
   canonicalStatus,
@@ -1296,10 +1296,13 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
         if (isCompaction && !turn.isCompaction) {
           turn.isCompaction = true;
           turn.compactionSummary = '';
+          // The engine's own `reason` cannot tell a user `/compact` from its
+          // context-window compaction; the manual mark can.
+          turn.compactionReason = compactionReasonFor(sessionID || turn.sessionId, info.reason);
           emitJsonStringMarker('[COMPACTION_STARTED]', {
             sessionID: sessionID || turn.sessionId,
             messageID: info.id || '',
-            reason: info.reason || 'auto',
+            reason: turn.compactionReason,
           });
         }
         const isAssistant = info.role === 'assistant' || info.type === 'assistant';
@@ -1587,9 +1590,10 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       // 必须经 marker 越权上报，宿主才能把结果送到对话列表。
       const compactSessionID = sessionID || props?.info?.id || props?.data?.sessionID || props?.sessionID || '';
       const summary = props?.text || props?.summary || props?.data?.text || props?.data?.summary || '';
-      const reason = props?.reason || props?.data?.reason || 'auto';
+      const reason = compactionReasonFor(compactSessionID, props?.reason || props?.data?.reason);
       logDebug('session.compacted / compaction.ended:', compactSessionID, 'summaryLength:', summary.length);
       resolvePendingCompaction(compactSessionID, true);
+      clearManualCompaction(compactSessionID);
       emitJsonStringMarker('[COMPACTION_ENDED]', {
         sessionID: compactSessionID,
         summary,
@@ -1608,7 +1612,9 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     case 'session.next.compaction.started.1': {
       const compactSessionID = sessionID || props?.data?.sessionID || props?.sessionID || props?.info?.id || '';
       const messageID = props?.messageID || props?.data?.messageID || '';
-      const reason = props?.reason || props?.data?.reason || 'auto';
+      // Read the manual mark but do not clear it: the compaction is still
+      // running and its ended/failed event needs the same answer.
+      const reason = compactionReasonFor(compactSessionID, props?.reason || props?.data?.reason);
       logDebug(`${type}:`, compactSessionID, reason);
       emitJsonStringMarker('[COMPACTION_STARTED]', {
         sessionID: compactSessionID,
@@ -1647,9 +1653,12 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
         const compactSessionID = sessionID || props?.info?.id || props?.data?.sessionID || props?.sessionID || '';
         logDebug(`${type} (compaction / no turn):`, compactSessionID, JSON.stringify(err).substring(0, 200));
         resolvePendingCompaction(compactSessionID, false, err?.message || String(err));
+        const reason = compactionReasonFor(compactSessionID, props?.reason || props?.data?.reason);
+        clearManualCompaction(compactSessionID);
         emitJsonStringMarker('[COMPACTION_FAILED]', {
           sessionID: compactSessionID,
           error: err?.message || String(err),
+          reason,
         });
         emitJsonStringMarker('[SESSION_COMPACT_RESULT]', JSON.stringify({
           sessionID: compactSessionID,
@@ -1885,8 +1894,11 @@ function _settleTurn(turn, { success, error, reason } = {}) {
     emitJsonStringMarker('[COMPACTION_ENDED]', {
       sessionID: turn.sessionId,
       summary: turn.compactionSummary || '',
-      reason: 'auto',
+      // Set when the compaction was first observed; the manual mark itself may
+      // already be cleared by the engine's own ended event.
+      reason: turn.compactionReason || compactionReasonFor(turn.sessionId),
     });
+    clearManualCompaction(turn.sessionId);
     turn.isCompaction = false;
   }
   // Tool-part reconciliation can emit `[MESSAGE]` blocks, including on the
