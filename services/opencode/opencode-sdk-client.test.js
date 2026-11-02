@@ -863,6 +863,41 @@ test('v2 listMessagesPage forwards the page size and returns the server cursor',
   }
 });
 
+test('v2 listMessagesPage reports the pre-filter page size so hosts can page', async () => {
+  lockV2();
+  const stub = stubFetch(() => jsonResponse({
+    // A real engine page mixes transcript rows with non-transcript ones
+    // (`idle`, `synthetic`). The latter are dropped here, so counting the
+    // returned entries would make a full page look short — and the host would
+    // conclude there is no older page. rawCount keeps the server's page size.
+    data: [
+      { info: { id: 'msg_3', role: 'assistant', time: { created: 300 } }, parts: [] },
+      { id: 'msg_idle', type: 'idle', time: { created: 200 } },
+      { info: { id: 'msg_1', role: 'user', time: { created: 100 } }, parts: [] },
+    ],
+    cursor: { previous: 'CUR_PREV', next: 'CUR_NEXT' },
+  }));
+  try {
+    const page = await listMessagesPage(SESSION_ID, '/repo', { limit: 200 });
+    assert.equal(page.entries.length, 2, 'idle rows are not transcript entries');
+    assert.equal(page.rawCount, 3, 'rawCount counts what the server returned');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('v1 listMessagesPage leaves rawCount null: one call is the whole transcript', async () => {
+  lockV1();
+  const stub = stubFetch(() => jsonResponse([{ info: { id: 'msg_1', role: 'user' }, parts: [] }]));
+  try {
+    const page = await listMessagesPage(SESSION_ID, '/repo', { limit: 200 });
+    assert.equal(page.rawCount, null);
+    assert.deepEqual(page.cursor, { previous: null, next: null });
+  } finally {
+    stub.restore();
+  }
+});
+
 test('v2 listMessagesPage clamps limit to the server max and never sends cursor with order', async () => {
   lockV2();
   const stub = stubFetch(() => jsonResponse({ data: [], cursor: { previous: null, next: null } }));

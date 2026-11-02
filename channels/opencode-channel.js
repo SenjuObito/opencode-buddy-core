@@ -117,11 +117,17 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
       let entries;
       let nextCursor = null;
       let previousCursor = null;
+      // Records the server returned for this page before non-transcript rows
+      // were dropped. Proves whether the page was full; `null` means the engine
+      // path is unpaginated (v1) and one call already returned everything.
+      let rawCount = null;
       if (all === true) {
         entries = await openCodeListAllMessages(sessionId || '', directory || undefined, {
           limit: limitNum > 0 ? limitNum : undefined,
           order: order === 'asc' ? 'asc' : 'desc',
         });
+        // The whole transcript was walked internally: this is not a page.
+        rawCount = null;
       } else {
         const page = await openCodeListMessagesPage(
           sessionId || '',
@@ -136,7 +142,16 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
         entries = page.entries;
         nextCursor = page.cursor.next;
         previousCursor = page.cursor.previous;
+        rawCount = typeof page.rawCount === 'number' ? page.rawCount : null;
       }
+      // 「还有更早」的判据只有「这一页是否满页」可靠：引擎在最后一页也会回
+      // `nextCursor`，而 entries 已被本层过滤（idle/synthetic 等），条目数不能
+      // 直接和 limit 比。rawCount 是过滤前的服务端条目数，用它判断才准确。
+      const hasEarlier = all === true
+        ? false
+        : (rawCount != null && limitNum > 0
+          ? rawCount >= limitNum
+          : Boolean(nextCursor));
       // 逐条输出（NDJSON）：此前整包单行 JSON 会被 daemon stdout 拦截器再次
       // stringify（转义膨胀），宿主侧还要 chunks 累积 + join + 全文提取——
       // 长会话恢复时内存峰值放大 5-8 倍。逐条输出每行都是小字符串，宿主
@@ -162,11 +177,12 @@ export async function handleOpenCodeCommand(command, args, stdinData) {
         sessionId: sessionId || '',
         messagesDone: true,
         count: entries.length,
-        // 默认顺序（不传 order）为「新→旧」，`nextCursor` 指向更早的一页；
-        // 宿主据此判断 hasEarlier 并续页，不需要自己猜顺序。
+        // 默认顺序（不传 order）为「新→旧」，`nextCursor` 指向更早的一页。
+        // 但游标在最后一页也可能非空，所以真正的判据是 rawCount 对 limit。
         nextCursor,
         previousCursor,
-        hasEarlier: Boolean(nextCursor),
+        rawCount,
+        hasEarlier,
       }));
       break;
     }

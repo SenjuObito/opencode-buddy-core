@@ -204,7 +204,7 @@ export const MAX_MESSAGE_PAGE_SIZE = 200;
 
 /** A page with no entries and no cursors (error / empty session). */
 function emptyMessagePage() {
-  return { entries: [], cursor: { previous: null, next: null } };
+  return { entries: [], cursor: { previous: null, next: null }, rawCount: 0 };
 }
 
 /** Normalize whatever the endpoint sent as `cursor` into the page shape. */
@@ -1971,6 +1971,13 @@ export function normalizeMessageEntry(entry, sessionId) {
  * towards older messages; `previous` walks back towards newer ones. A cursor
  * must not be combined with `order` (the server answers 400).</p>
  *
+ * <p>A cursor is NOT proof that an older page exists: on some engine builds the
+ * last page still carries `next`. `rawCount` is the number of records the server
+ * returned for this page <em>before</em> non-transcript rows (`idle`,
+ * `synthetic`, …) were dropped here; hosts compare it with the requested limit
+ * to decide "there is an older page". It is `null` on the unpaginated v1 path,
+ * where one call is the whole transcript.</p>
+ *
  * @param {string} sessionId
  * @param {string} [directory]
  * @param {object} [options]
@@ -1979,7 +1986,7 @@ export function normalizeMessageEntry(entry, sessionId) {
  * @param {'asc'|'desc'} [options.order] only valid on the first page
  * @param {string} [options.type] message type filter, repeated on every page
  * @param {boolean} [options.tolerateError] resolve to an empty page instead of throwing
- * @returns {Promise<{ entries: Array<object>, cursor: { previous: string|null, next: string|null } }>}
+ * @returns {Promise<{ entries: Array<object>, cursor: { previous: string|null, next: string|null }, rawCount: number|null }>}
  */
 export async function listMessagesPage(sessionId, directory, options = {}) {
   if (engineRegistry.isV2()) {
@@ -2196,7 +2203,7 @@ export async function listMessagesPage(sessionId, directory, options = {}) {
       }
       entries.push(normalizeMessageEntry({ info, parts }, sessionId));
     }
-    return { entries, cursor };
+    return { entries, cursor, rawCount: list.length };
   }
 
   const params = { sessionID: sessionId };
@@ -2222,6 +2229,9 @@ export async function listMessagesPage(sessionId, directory, options = {}) {
       .map((entry) => normalizeMessageEntry(entry, sessionId)),
     // The v1 SDK call is unpaginated: it always returns the whole transcript.
     cursor: { previous: null, next: null },
+    // No page boundary to measure: `rawCount` stays null so callers do not
+    // mistake a long v1 transcript for "one full page of many".
+    rawCount: null,
   };
 }
 
