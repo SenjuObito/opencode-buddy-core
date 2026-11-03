@@ -22,7 +22,7 @@
 import { createOpencodeClient } from '@opencode-ai/sdk/v2';
 import * as serveManager from './opencode-serve-manager.js';
 import * as engineRegistry from './engine-registry.js';
-import { registerPendingCompaction, resolvePendingCompaction, markManualCompaction, clearManualCompaction } from './compaction-tracker.js';
+import { registerPendingCompaction, armPendingCompactionTimeout, resolvePendingCompaction, markManualCompaction, clearManualCompaction } from './compaction-tracker.js';
 
 let _client = null;
 let _baseUrl = null;
@@ -1077,21 +1077,33 @@ export async function summarizeSession(sessionId, directory, model) {
   params.modelID = resolved.modelID;
   console.error(`[summarize] POST /session/${sessionId}/summarize — waiting for LLM completion...`);
   const startedAt = Date.now();
-  let result;
+  // Register before the request: the terminal event can race the HTTP response.
+  // No timeout yet — the v1 request itself may legitimately run for a long time.
+  const waitPromise = registerPendingCompaction(sessionId, 0);
+  waitPromise.catch(() => {});
   try {
-    result = await getClient().session.summarize(params);
-  } catch (err) {
+    let result;
+    try {
+      result = await getClient().session.summarize(params);
+    } catch (err) {
+      resolvePendingCompaction(sessionId, false, err?.message || String(err));
+      throw err;
+    }
+    console.error(`[summarize] HTTP returned after ${Date.now() - startedAt}ms, error=${result.error ? JSON.stringify(result.error) : 'none'}`);
+    if (result.error) {
+      const error = JSON.stringify(result.error);
+      resolvePendingCompaction(sessionId, false, error);
+      throw new Error(`Summarize failed: ${error}`);
+    }
+    // The HTTP call is done; from here the only thing left is the terminal
+    // marker. Now the v2 terminal budget applies.
+    armPendingCompactionTimeout(sessionId, 60000);
+    await waitPromise;
+  } finally {
+    // The daemon reads and clears this mark at the terminal event. Clearing it
+    // here only removes it after that event (or after a local failure).
     clearManualCompaction(sessionId);
-    throw err;
   }
-  console.error(`[summarize] HTTP returned after ${Date.now() - startedAt}ms, error=${result.error ? JSON.stringify(result.error) : 'none'}`);
-  if (result.error) {
-    clearManualCompaction(sessionId);
-    throw new Error(`Summarize failed: ${JSON.stringify(result.error)}`);
-  }
-  // The turn may settle after this returns; `turn.compactionReason` already
-  // carries the trigger, so the mark can go now instead of lingering until TTL.
-  clearManualCompaction(sessionId);
 }
 
 /**

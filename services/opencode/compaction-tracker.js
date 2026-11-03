@@ -1,38 +1,70 @@
 /**
  * compaction-tracker.js
  *
- * Tracks pending session compaction operations in OpenCode v2.
+ * Tracks pending session compaction operations in OpenCode v1 and v2.
  * In v2, POST /api/session/{sessionId}/compact is an asynchronous endpoint
  * that returns 204 No Content immediately while the actual compaction
  * runs in the background and emits SSE events:
  *   - session.compaction.ended / session.next.compaction.ended (success)
  *   - session.compaction.failed / session.next.compaction.failed (failure)
  *
+ * In v1, the summarize HTTP request itself waits for the LLM, but its response
+ * can still race the terminal SSE event. The pending waiter is registered
+ * before the request so a terminal that lands first is not lost; its timeout is
+ * armed only after the HTTP call returns, so a long compaction is not cut off
+ * by the v2 terminal budget.
+ *
  * This tracker allows summarizeSession to await the true outcome.
  */
 
 const _pendingCompaction = new Map();
 
+/**
+ * Register a compaction waiter.
+ *
+ * @param {string} sessionId
+ * @param {number} [timeoutMs] 0 registers the waiter without a timeout. The v1
+ *   summarize path uses this while the synchronous HTTP request is in flight,
+ *   then calls armPendingCompactionTimeout once it is waiting for SSE.
+ */
 export function registerPendingCompaction(sessionId, timeoutMs = 60000) {
   if (!sessionId) return Promise.resolve(true);
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      _pendingCompaction.delete(sessionId);
-      reject(new Error(`Session compaction timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
+    const timer = timeoutMs > 0
+      ? setTimeout(() => {
+        _pendingCompaction.delete(sessionId);
+        reject(new Error(`Session compaction timed out after ${timeoutMs}ms`));
+      }, timeoutMs)
+      : null;
 
     if (_pendingCompaction.has(sessionId)) {
-      clearTimeout(_pendingCompaction.get(sessionId).timer);
+      const previous = _pendingCompaction.get(sessionId);
+      if (previous.timer) clearTimeout(previous.timer);
     }
     _pendingCompaction.set(sessionId, { resolve, reject, timer });
   });
+}
+
+/** Start (or restart) the timeout once the waiter is waiting for a terminal. */
+export function armPendingCompactionTimeout(sessionId, timeoutMs = 60000) {
+  if (!sessionId || timeoutMs <= 0) return false;
+  const pending = _pendingCompaction.get(sessionId);
+  if (!pending) return false;
+  if (pending.timer) clearTimeout(pending.timer);
+  pending.timer = setTimeout(() => {
+    if (_pendingCompaction.get(sessionId) !== pending) return;
+    _pendingCompaction.delete(sessionId);
+    pending.reject(new Error(`Session compaction timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+  pending.timer.unref?.();
+  return true;
 }
 
 export function resolvePendingCompaction(sessionId, success, error) {
   if (!sessionId) return false;
   const pending = _pendingCompaction.get(sessionId);
   if (pending) {
-    clearTimeout(pending.timer);
+    if (pending.timer) clearTimeout(pending.timer);
     _pendingCompaction.delete(sessionId);
     if (success) {
       pending.resolve(true);

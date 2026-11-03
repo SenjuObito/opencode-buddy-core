@@ -22,7 +22,7 @@ import {
   toV2ModelRef,
   unshareSession,
 } from './opencode-sdk-client.js';
-import { resolvePendingCompaction, clearPendingCompactions } from './compaction-tracker.js';
+import { resolvePendingCompaction, clearPendingCompactions, compactionReasonFor } from './compaction-tracker.js';
 
 /**
  * Route-contract tests for the v2 message endpoint.
@@ -793,6 +793,60 @@ test('v2 summarizeSession rejects when compaction fails in background', async ()
       {
         message: 'Compaction quota exceeded',
       },
+    );
+  } finally {
+    stub.restore();
+    clearPendingCompactions();
+  }
+});
+
+test('v1 summarizeSession waits for the terminal and keeps the manual mark until then', async () => {
+  lockV1();
+  clearPendingCompactions();
+  let reasonAtTerminal = null;
+  let settled = false;
+  const stub = stubFetch((url) => {
+    if (url.includes('/session/ses_v1_comp/summarize')) {
+      setTimeout(() => {
+        reasonAtTerminal = compactionReasonFor('ses_v1_comp', 'auto');
+        resolvePendingCompaction('ses_v1_comp', true);
+      }, 30);
+      return jsonResponse({});
+    }
+    return jsonResponse({});
+  });
+  try {
+    const promise = summarizeSession('ses_v1_comp', undefined, 'opencode/test-model');
+    promise.then(() => { settled = true; }, () => { settled = true; });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(settled, false, 'the HTTP response alone must not complete the command');
+
+    await promise;
+    assert.equal(reasonAtTerminal, 'manual', 'the manual mark must survive until the terminal');
+    assert.equal(compactionReasonFor('ses_v1_comp', 'auto'), 'auto', 'the terminal consumes the mark');
+  } finally {
+    stub.restore();
+    clearPendingCompactions();
+  }
+});
+
+test('v1 summarizeSession rejects when the compaction terminal reports failure', async () => {
+  lockV1();
+  clearPendingCompactions();
+  const stub = stubFetch((url) => {
+    if (url.includes('/session/ses_v1_comp_fail/summarize')) {
+      setTimeout(() => {
+        resolvePendingCompaction('ses_v1_comp_fail', false, 'v1 compaction failed');
+      }, 30);
+      return jsonResponse({});
+    }
+    return jsonResponse({});
+  });
+  try {
+    await assert.rejects(
+      () => summarizeSession('ses_v1_comp_fail', undefined, 'opencode/test-model'),
+      { message: 'v1 compaction failed' },
     );
   } finally {
     stub.restore();

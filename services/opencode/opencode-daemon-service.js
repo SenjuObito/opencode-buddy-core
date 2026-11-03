@@ -1287,6 +1287,8 @@ function _failStaleCompaction(sessionID, message) {
     error: message,
     startedAt: entry.startedAt,
   });
+  // Resolve after the marker so the host closes the optimistic record first.
+  resolvePendingCompaction(sessionID, false, message);
 }
 
 /**
@@ -1694,7 +1696,6 @@ function _dispatchInnerEvent(type, props, sessionID, turn, evt) {
       const startedAt = _activeCompactions.get(compactSessionID)?.startedAt;
       logDebug('session.compacted / compaction.ended:', compactSessionID, 'summaryLength:', summary.length);
       _endActiveCompaction(compactSessionID);
-      resolvePendingCompaction(compactSessionID, true);
       clearManualCompaction(compactSessionID);
       emitJsonStringMarker('[COMPACTION_ENDED]', {
         sessionID: compactSessionID,
@@ -1709,6 +1710,9 @@ function _dispatchInnerEvent(type, props, sessionID, turn, evt) {
         sessionID: compactSessionID,
         success: true,
       }));
+      // Resolve after the markers: the summarize RPC result must never reach the
+      // host before the authoritative terminal record update.
+      resolvePendingCompaction(compactSessionID, true);
       break;
     }
     case 'session.compaction.started':
@@ -1773,7 +1777,7 @@ function _dispatchInnerEvent(type, props, sessionID, turn, evt) {
           break;
         }
         logDebug(`${type} (compaction / no turn):`, compactSessionID, JSON.stringify(err).substring(0, 200));
-        resolvePendingCompaction(compactSessionID, false, err?.message || String(err));
+        const failureMessage = err?.message || String(err);
         const reason = compactionReasonFor(compactSessionID, props?.reason || props?.data?.reason);
         const messageID = props?.inputID || props?.data?.inputID
           || props?.messageID || props?.data?.messageID || evt?.id || '';
@@ -1783,15 +1787,17 @@ function _dispatchInnerEvent(type, props, sessionID, turn, evt) {
         emitJsonStringMarker('[COMPACTION_FAILED]', {
           sessionID: compactSessionID,
           messageID,
-          error: err?.message || String(err),
+          error: failureMessage,
           reason,
           startedAt,
         });
         emitJsonStringMarker('[SESSION_COMPACT_RESULT]', JSON.stringify({
           sessionID: compactSessionID,
           success: false,
-          error: err?.message || String(err),
+          error: failureMessage,
         }));
+        // Resolve after the markers so the host closes the optimistic record first.
+        resolvePendingCompaction(compactSessionID, false, failureMessage);
       }
       break;
     }
@@ -2040,6 +2046,13 @@ function _settleTurn(turn, { success, error, reason } = {}) {
       });
     }
     clearManualCompaction(turn.sessionId);
+    // A v1 compaction can also settle through the active turn instead of
+    // session.compacted. Both are terminal paths for the same pending waiter.
+    resolvePendingCompaction(
+      turn.sessionId,
+      Boolean(success),
+      error?.message || String(error || 'compaction failed'),
+    );
     turn.isCompaction = false;
   }
   // Tool-part reconciliation can emit `[MESSAGE]` blocks, including on the

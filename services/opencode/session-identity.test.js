@@ -11,7 +11,13 @@ import {
 } from '../../request-context.js';
 import * as registry from './engine-registry.js';
 import { setBaseUrl, resetClient } from './opencode-sdk-client.js';
-import { markManualCompaction, clearManualCompaction } from './compaction-tracker.js';
+import {
+  markManualCompaction,
+  clearManualCompaction,
+  registerPendingCompaction,
+  isCompactionPending,
+  clearPendingCompactions,
+} from './compaction-tracker.js';
 import {
   _handleEvent,
   _activeTurns,
@@ -674,6 +680,130 @@ test('v1 compaction turn intercepts content delta as [COMPACTION_DELTA] and sett
     assert.equal(endedPayload.summary, 'V1 summary part');
   } finally {
     _activeTurns.delete('ses_v1_compact');
+  }
+});
+
+test('v1 session.compacted without a turn keeps the manual reason and resolves pending after the marker', async () => {
+  const sessionId = 'ses_v1_no_turn_manual';
+  clearPendingCompactions();
+  markManualCompaction(sessionId);
+
+  const order = [];
+  const pending = registerPendingCompaction(sessionId, 0);
+  pending.then(() => order.push('resolved'), () => order.push('rejected'));
+
+  try {
+    const emitted = captureEmits(() => {
+      _handleEvent({
+        type: 'session.compacted',
+        properties: {
+          sessionID: sessionId,
+          reason: 'auto',
+          text: 'v1 summary',
+        },
+      });
+      order.push('emitted');
+    });
+
+    assert.equal(isCompactionPending(sessionId), false);
+    await pending;
+    assert.deepEqual(order, ['emitted', 'resolved']);
+
+    const ended = emitted.find((e) => e.line.startsWith('[COMPACTION_ENDED]'));
+    assert.ok(ended);
+    const endedPayload = JSON.parse(ended.line.substring('[COMPACTION_ENDED]'.length).trim());
+    assert.equal(endedPayload.reason, 'manual');
+    assert.equal(endedPayload.summary, 'v1 summary');
+  } finally {
+    clearPendingCompactions();
+    clearManualCompaction(sessionId);
+  }
+});
+
+test('v1 compaction failure resolves pending after [COMPACTION_FAILED]', async () => {
+  const sessionId = 'ses_v1_no_turn_failed';
+  clearPendingCompactions();
+  markManualCompaction(sessionId);
+
+  const order = [];
+  const pending = registerPendingCompaction(sessionId, 0);
+  pending.then(() => order.push('resolved'), () => order.push('rejected'));
+
+  try {
+    const emitted = captureEmits(() => {
+      _handleEvent({
+        type: 'session.compaction.failed',
+        properties: {
+          sessionID: sessionId,
+          reason: 'auto',
+          error: { message: 'v1 compaction failed' },
+        },
+      });
+      order.push('emitted');
+    });
+
+    assert.equal(isCompactionPending(sessionId), false);
+    await assert.rejects(pending, /v1 compaction failed/);
+    assert.deepEqual(order, ['emitted', 'rejected']);
+
+    const failed = emitted.find((e) => e.line.startsWith('[COMPACTION_FAILED]'));
+    assert.ok(failed);
+    assert.equal(
+      JSON.parse(failed.line.substring('[COMPACTION_FAILED]'.length).trim()).reason,
+      'manual',
+    );
+  } finally {
+    clearPendingCompactions();
+    clearManualCompaction(sessionId);
+  }
+});
+
+test('v1 turn compaction resolves pending after [COMPACTION_ENDED]', async () => {
+  const sessionId = 'ses_v1_settle_pending';
+  clearPendingCompactions();
+  const turn = {
+    sessionId,
+    requestId: 'req_v1_settle',
+    turnId: 103,
+    settled: false,
+    isCompaction: true,
+    compactionMessageID: 'msg_v1_settle',
+    compactionSummary: 'v1 turn summary',
+    compactionReason: 'manual',
+    compactionStartedAt: Date.now(),
+    parts: new Map(),
+    assistantMessagesMap: new Map(),
+    toolUseDone: new Set(),
+    toolResultDone: new Set(),
+    toolUseInput: new Map(),
+    toolNames: new Map(),
+    resolve: () => {},
+    reject: () => {},
+  };
+  _activeTurns.set(sessionId, turn);
+
+  const order = [];
+  const pending = registerPendingCompaction(sessionId, 0);
+  pending.then(() => order.push('resolved'), () => order.push('rejected'));
+
+  try {
+    const emitted = captureEmits(() => {
+      _settleTurn(turn, { success: true });
+      order.push('emitted');
+    });
+
+    await pending;
+    assert.deepEqual(order, ['emitted', 'resolved']);
+
+    const ended = emitted.find((e) => e.line.startsWith('[COMPACTION_ENDED]'));
+    assert.ok(ended);
+    assert.equal(
+      JSON.parse(ended.line.substring('[COMPACTION_ENDED]'.length).trim()).summary,
+      'v1 turn summary',
+    );
+  } finally {
+    _activeTurns.delete(sessionId);
+    clearPendingCompactions();
   }
 });
 

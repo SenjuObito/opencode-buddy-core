@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   registerPendingCompaction,
+  armPendingCompactionTimeout,
   resolvePendingCompaction,
   isCompactionPending,
   clearPendingCompactions,
@@ -42,4 +43,30 @@ test('compaction-tracker: times out if no event received', async () => {
 
   await assert.rejects(promise, /timed out/);
   assert.equal(isCompactionPending(sessionId), false);
+});
+
+test('compaction-tracker: timeout can be armed after a no-timeout registration', async () => {
+  clearPendingCompactions();
+  const sessionId = 'ses_test_4';
+  const promise = registerPendingCompaction(sessionId, 0);
+  let settled = false;
+  promise.then(() => { settled = true; }, () => { settled = true; });
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(settled, false);
+  assert.equal(isCompactionPending(sessionId), true);
+
+  assert.equal(armPendingCompactionTimeout(sessionId, 20), true);
+  await assert.rejects(promise, /timed out/);
+  assert.equal(isCompactionPending(sessionId), false);
+});
+
+test('compaction-tracker: arming a resolved waiter is a no-op', async () => {
+  clearPendingCompactions();
+  const sessionId = 'ses_test_5';
+  const promise = registerPendingCompaction(sessionId, 0);
+
+  resolvePendingCompaction(sessionId, true);
+  assert.equal(armPendingCompactionTimeout(sessionId, 20), false);
+  await assert.doesNotReject(promise);
 });
