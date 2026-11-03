@@ -51,12 +51,16 @@ export function armPendingCompactionTimeout(sessionId, timeoutMs = 60000) {
   const pending = _pendingCompaction.get(sessionId);
   if (!pending) return false;
   if (pending.timer) clearTimeout(pending.timer);
+  // Not unref'd on purpose: this timer is the only thing that can settle the
+  // waiter once the caller is awaiting it, so it must keep the event loop alive
+  // exactly like the timer registerPendingCompaction installs. Unref'ing it
+  // lets the process exit (or node:test cancel the test) while the await is
+  // still pending.
   pending.timer = setTimeout(() => {
     if (_pendingCompaction.get(sessionId) !== pending) return;
     _pendingCompaction.delete(sessionId);
     pending.reject(new Error(`Session compaction timed out after ${timeoutMs}ms`));
   }, timeoutMs);
-  pending.timer.unref?.();
   return true;
 }
 

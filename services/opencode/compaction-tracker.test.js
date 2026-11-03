@@ -57,7 +57,15 @@ test('compaction-tracker: timeout can be armed after a no-timeout registration',
   assert.equal(isCompactionPending(sessionId), true);
 
   assert.equal(armPendingCompactionTimeout(sessionId, 20), true);
-  await assert.rejects(promise, /timed out/);
+  // Hold the loop open while awaiting: the armed timeout is the module's only
+  // pending handle here, so a test that drains the loop first gets cancelled
+  // instead of seeing the rejection.
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    await assert.rejects(promise, /timed out/);
+  } finally {
+    clearInterval(keepAlive);
+  }
   assert.equal(isCompactionPending(sessionId), false);
 });
 
