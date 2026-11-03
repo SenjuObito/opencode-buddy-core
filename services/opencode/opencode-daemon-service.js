@@ -96,6 +96,22 @@ const _sseSubs = new Map();
 const _sseSubPromises = new Map();
 /** @type {Map<string, object>} sessionID → turn record */
 const _activeTurns = new Map();
+/**
+ * Compaction currently running per session.
+ *
+ * <p>The engine emits `compaction.started` but does not guarantee a terminal
+ * event: an automatic compaction that fails inside `compactAfterOverflow`
+ * returns without publishing `ended`/`failed`. Without this record the host
+ * would keep a "compacting" card forever, so a stale entry is settled as a
+ * failure once the session goes idle or the TTL expires.</p>
+ *
+ * @type {Map<string, { messageID: string, reason: string, startedAt: number, timer: NodeJS.Timeout | null }>}
+ */
+const _activeCompactions = new Map();
+/** A compaction that never reports a terminal event is failed after this long. */
+const COMPACTION_TTL_MS = 180_000;
+/** Grace after `session.idle` before a still-running compaction is failed. */
+const COMPACTION_IDLE_GRACE_MS = 3_000;
 /** @type {Map<string, { directory?: string }>} sessionID → session state */
 const _sessions = new Map();
 /**
@@ -509,7 +525,7 @@ function _handleEvent(evt) {
       turnId: turn?.turnId ?? null,
       seq,
     },
-    () => _dispatchInnerEvent(type, props, sessionID, turn),
+    () => _dispatchInnerEvent(type, props, sessionID, turn, evt),
   );
 }
 
@@ -1223,7 +1239,75 @@ function _revertStateForLifecycle(type, props) {
   return undefined;
 }
 
-function _dispatchInnerEvent(type, props, sessionID, turn) {
+/**
+ * Remember the compaction currently running for a session.
+ *
+ * <p>Repeated `started` signals for the same session belong to the same
+ * compaction (the engine runs one at a time), so the first start time wins and
+ * a later id only fills in what was missing.</p>
+ */
+function _beginActiveCompaction(sessionID, { messageID, reason } = {}) {
+  if (!sessionID) return;
+  const existing = _activeCompactions.get(sessionID);
+  const entry = {
+    messageID: messageID || existing?.messageID || '',
+    reason: reason || existing?.reason || 'auto',
+    startedAt: existing?.startedAt ?? Date.now(),
+    timer: existing?.timer ?? null,
+  };
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.timer = setTimeout(
+    () => _failStaleCompaction(sessionID, 'compaction timed out'),
+    COMPACTION_TTL_MS,
+  );
+  entry.timer.unref?.();
+  _activeCompactions.set(sessionID, entry);
+}
+
+/** Forget the running compaction and cancel its TTL timer. */
+function _endActiveCompaction(sessionID) {
+  if (!sessionID) return;
+  const entry = _activeCompactions.get(sessionID);
+  if (entry?.timer) clearTimeout(entry.timer);
+  _activeCompactions.delete(sessionID);
+}
+
+/** The engine never reported a terminal event: settle the card as a failure. */
+function _failStaleCompaction(sessionID, message) {
+  const entry = _activeCompactions.get(sessionID);
+  if (!entry) return;
+  _endActiveCompaction(sessionID);
+  logWarn('[compaction] terminal missing:', sessionID, message);
+  emitJsonStringMarker('[COMPACTION_ENDED]', {
+    sessionID,
+    messageID: entry.messageID,
+    reason: entry.reason,
+    summary: '',
+    failed: true,
+    error: message,
+    startedAt: entry.startedAt,
+  });
+}
+
+/**
+ * A session went idle while a compaction was still marked running.
+ *
+ * <p>Normally `ended`/`failed` lands first, but an automatic compaction that
+ * fails inside the engine returns without publishing a terminal event. Wait a
+ * short grace so a late terminal can still win, then close the card.</p>
+ */
+function _scheduleIdleCompactionSettle(sessionID) {
+  const entry = sessionID ? _activeCompactions.get(sessionID) : null;
+  if (!entry) return;
+  const timer = setTimeout(() => {
+    const current = _activeCompactions.get(sessionID);
+    if (!current || current.startedAt !== entry.startedAt) return;
+    _failStaleCompaction(sessionID, 'compaction ended without a result');
+  }, COMPACTION_IDLE_GRACE_MS);
+  timer.unref?.();
+}
+
+function _dispatchInnerEvent(type, props, sessionID, turn, evt) {
   switch (type) {
     case 'session.created':
     case 'session.updated':
@@ -1290,19 +1374,28 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       if (turn && props?.info && typeof props.info === 'object') {
         const info = props.info;
         const isCompaction = info.role === 'compaction'
+          || info.type === 'compaction'
           || info.mode === 'compaction'
           || info.agent === 'compaction'
-          || info.isCompactSummary === true;
+          || info.isCompactSummary === true
+          || info.summary === true;
         if (isCompaction && !turn.isCompaction) {
           turn.isCompaction = true;
           turn.compactionSummary = '';
+          turn.compactionMessageID = info.id || '';
+          turn.compactionStartedAt = Date.now();
           // The engine's own `reason` cannot tell a user `/compact` from its
           // context-window compaction; the manual mark can.
           turn.compactionReason = compactionReasonFor(sessionID || turn.sessionId, info.reason);
+          _beginActiveCompaction(sessionID || turn.sessionId, {
+            messageID: turn.compactionMessageID,
+            reason: turn.compactionReason,
+          });
           emitJsonStringMarker('[COMPACTION_STARTED]', {
             sessionID: sessionID || turn.sessionId,
             messageID: info.id || '',
             reason: turn.compactionReason,
+            startedAt: turn.compactionStartedAt,
           });
         }
         const isAssistant = info.role === 'assistant' || info.type === 'assistant';
@@ -1555,6 +1648,10 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     case 'session.execution.succeeded':
       if (turn) _settleTurn(turn, { success: true });
       else if (sessionID) _handleSubagentChildTerminal(sessionID, 'completed');
+      // A compaction is not a turn, so an engine that fails one internally can
+      // leave `started` without a terminal event. Close it once the session is
+      // demonstrably idle.
+      _scheduleIdleCompactionSettle(sessionID);
       break;
     case 'session.step.failed':
     case 'session.next.step.failed': {
@@ -1591,15 +1688,22 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       const compactSessionID = sessionID || props?.info?.id || props?.data?.sessionID || props?.sessionID || '';
       const summary = props?.text || props?.summary || props?.data?.text || props?.data?.summary || '';
       const reason = compactionReasonFor(compactSessionID, props?.reason || props?.data?.reason);
+      // `ended` carries the persisted compaction message id. The host adopts it
+      // so a live card and the history row are one identity instead of two.
+      const messageID = props?.messageID || props?.data?.messageID || evt?.id || '';
+      const startedAt = _activeCompactions.get(compactSessionID)?.startedAt;
       logDebug('session.compacted / compaction.ended:', compactSessionID, 'summaryLength:', summary.length);
+      _endActiveCompaction(compactSessionID);
       resolvePendingCompaction(compactSessionID, true);
       clearManualCompaction(compactSessionID);
       emitJsonStringMarker('[COMPACTION_ENDED]', {
         sessionID: compactSessionID,
+        messageID,
         summary,
         reason,
         tokens: props?.tokens || props?.data?.tokens,
         recent: props?.recent || props?.data?.recent,
+        startedAt,
       });
       emitJsonStringMarker('[SESSION_COMPACT_RESULT]', JSON.stringify({
         sessionID: compactSessionID,
@@ -1611,15 +1715,24 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
     case 'session.next.compaction.started':
     case 'session.next.compaction.started.1': {
       const compactSessionID = sessionID || props?.data?.sessionID || props?.sessionID || props?.info?.id || '';
-      const messageID = props?.messageID || props?.data?.messageID || '';
+      // v2.2 names the compaction with `inputID`; older payloads use
+      // `messageID`. The final id is adopted from `ended` either way.
+      const messageID = props?.inputID || props?.data?.inputID
+        || props?.messageID || props?.data?.messageID
+        || props?.info?.id || evt?.id || '';
       // Read the manual mark but do not clear it: the compaction is still
       // running and its ended/failed event needs the same answer.
       const reason = compactionReasonFor(compactSessionID, props?.reason || props?.data?.reason);
+      _beginActiveCompaction(compactSessionID, { messageID, reason });
+      // A repeated start belongs to the same compaction: report the original
+      // start time so the card's elapsed clock does not restart.
+      const startedAt = _activeCompactions.get(compactSessionID)?.startedAt ?? Date.now();
       logDebug(`${type}:`, compactSessionID, reason);
       emitJsonStringMarker('[COMPACTION_STARTED]', {
         sessionID: compactSessionID,
         messageID,
         reason,
+        startedAt,
       });
       break;
     }
@@ -1651,14 +1764,28 @@ function _dispatchInnerEvent(type, props, sessionID, turn) {
       // 时错误属于当前对话 turn，不能误报为压缩失败。
       if (!turn || isCompactionFailed) {
         const compactSessionID = sessionID || props?.info?.id || props?.data?.sessionID || props?.sessionID || '';
+        const compactionTracked = _activeCompactions.has(compactSessionID);
+        // A generic `session.error` with no turn is not proof that a compaction
+        // failed. Only report one when the engine says so or when a compaction
+        // is actually running for this session — otherwise the host would
+        // create a phantom failure card.
+        if (!isCompactionFailed && !compactionTracked) {
+          break;
+        }
         logDebug(`${type} (compaction / no turn):`, compactSessionID, JSON.stringify(err).substring(0, 200));
         resolvePendingCompaction(compactSessionID, false, err?.message || String(err));
         const reason = compactionReasonFor(compactSessionID, props?.reason || props?.data?.reason);
+        const messageID = props?.inputID || props?.data?.inputID
+          || props?.messageID || props?.data?.messageID || evt?.id || '';
+        const startedAt = _activeCompactions.get(compactSessionID)?.startedAt;
+        _endActiveCompaction(compactSessionID);
         clearManualCompaction(compactSessionID);
         emitJsonStringMarker('[COMPACTION_FAILED]', {
           sessionID: compactSessionID,
+          messageID,
           error: err?.message || String(err),
           reason,
+          startedAt,
         });
         emitJsonStringMarker('[SESSION_COMPACT_RESULT]', JSON.stringify({
           sessionID: compactSessionID,
@@ -1891,13 +2018,27 @@ function _settleTurn(turn, { success, error, reason } = {}) {
   turn.settled = true;
   turn.settleReason = reason || (success ? 'idle' : 'error');
   if (turn.isCompaction) {
-    emitJsonStringMarker('[COMPACTION_ENDED]', {
-      sessionID: turn.sessionId,
-      summary: turn.compactionSummary || '',
-      // Set when the compaction was first observed; the manual mark itself may
-      // already be cleared by the engine's own ended event.
-      reason: turn.compactionReason || compactionReasonFor(turn.sessionId),
-    });
+    const messageID = turn.compactionMessageID || '';
+    const startedAt = turn.compactionStartedAt;
+    const reason = turn.compactionReason || compactionReasonFor(turn.sessionId);
+    _endActiveCompaction(turn.sessionId);
+    if (success) {
+      emitJsonStringMarker('[COMPACTION_ENDED]', {
+        sessionID: turn.sessionId,
+        messageID,
+        summary: turn.compactionSummary || '',
+        reason,
+        startedAt,
+      });
+    } else {
+      emitJsonStringMarker('[COMPACTION_FAILED]', {
+        sessionID: turn.sessionId,
+        messageID,
+        error: error?.message || String(error || 'compaction failed'),
+        reason,
+        startedAt,
+      });
+    }
     clearManualCompaction(turn.sessionId);
     turn.isCompaction = false;
   }
@@ -2697,6 +2838,10 @@ export async function shutdownPersistentRuntimes() {
     }
   }
   _activeTurns.clear();
+  for (const entry of _activeCompactions.values()) {
+    if (entry.timer) clearTimeout(entry.timer);
+  }
+  _activeCompactions.clear();
 
   // Close every per-directory SSE subscription.
   for (const sub of _sseSubs.values()) {

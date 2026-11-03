@@ -581,6 +581,8 @@ test('v2 listMessages preserves compaction message as isCompactSummary', async (
     assert.equal(compactEntry.info.isCompactSummary, true);
     assert.equal(compactEntry.info.compactMetadata?.trigger, 'manual');
     assert.equal(compactEntry.info.compactMetadata?.userContext, undefined);
+    assert.equal(compactEntry.info.compactionStatus, 'completed');
+    assert.equal(compactEntry.info.compactionReason, 'manual');
     assert.equal(compactEntry.parts[0]?.text, 'The session was compacted.');
   } finally {
     stub.restore();
@@ -603,6 +605,37 @@ test('v1 normalizeMessageEntry normalizes assistant compaction summary', () => {
   assert.equal(normalized.info.isCompactSummary, true);
   assert.equal(normalized.info.compactMetadata?.trigger, 'manual');
   assert.equal(normalized.parts[0]?.text, 'Summary of session');
+});
+
+test('v2 compaction history keeps status, reason, tokens and error', async () => {
+  lockV2();
+  const stub = stubFetch(() =>
+    jsonResponse({
+      data: [
+        {
+          type: 'compaction',
+          id: 'cmp_failed',
+          status: 'failed',
+          reason: 'auto',
+          error: { type: 'compaction.unavailable', message: 'Nothing to compact yet' },
+          tokens: { total: 1234 },
+          time: { created: 3000 },
+        },
+      ],
+    }),
+  );
+  try {
+    const messages = await listMessages(SESSION_ID);
+    assert.equal(messages.length, 1);
+    const info = messages[0].info;
+    assert.equal(info.role, 'compaction');
+    assert.equal(info.compactionStatus, 'failed');
+    assert.equal(info.compactionReason, 'auto');
+    assert.equal(info.tokens.total, 1234);
+    assert.equal(info.error.message, 'Nothing to compact yet');
+  } finally {
+    stub.restore();
+  }
 });
 
 test('v2 shareSession posts to /api/session/{id}/share', async () => {

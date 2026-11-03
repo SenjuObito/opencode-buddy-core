@@ -1947,9 +1947,20 @@ export function normalizeMessageEntry(entry, sessionId) {
   if (isCompaction) {
     info.role = 'compaction';
     info.isCompactSummary = true;
+    // Keep the lifecycle facts for every caller (v1 entries, v2 list pages and
+    // single-message reads). The host renders a failed compaction as a failure
+    // card and uses `compactionReason` for its wording.
+    if (info.compactionStatus == null) {
+      info.compactionStatus = info.status || 'completed';
+    }
+    if (info.compactionReason == null) {
+      // v1 has no reason field and produced compaction through the manual
+      // summarize path; keep the historical default there.
+      info.compactionReason = info.reason || info.compactMetadata?.trigger || 'manual';
+    }
     if (!info.compactMetadata) {
       info.compactMetadata = {
-        trigger: info.reason || 'manual',
+        trigger: info.compactionReason,
       };
     }
   }
@@ -2097,13 +2108,22 @@ export async function listMessagesPage(sessionId, directory, options = {}) {
       if (m.info && typeof m.info === 'object' && Array.isArray(m.parts)) {
         if (m.info.role === 'compaction') {
           m.info.isCompactSummary = true;
+          // The persisted row carries the lifecycle facts the card needs. Keep
+          // them: without `status` a failed compaction would render as a
+          // successful summary, and without `reason` the card cannot say
+          // whether the user or the context window triggered it.
+          m.info.compactionStatus = m.info.status || m.info.compactionStatus || 'completed';
+          m.info.compactionReason = m.info.reason
+            || m.info.compactionReason
+            || m.info.compactMetadata?.trigger
+            || 'auto';
           if (!m.info.compactMetadata) {
             // The summary is the message body, not a user instruction: copying
             // it into `userContext` made the webview print the whole summary
             // again as "Context: ...". `userContext` stays reserved for a real
             // /compact focus supplied by the user.
             m.info.compactMetadata = {
-              trigger: m.info.reason || 'manual',
+              trigger: m.info.compactionReason,
             };
           }
         }
@@ -2123,15 +2143,30 @@ export async function listMessagesPage(sessionId, directory, options = {}) {
       if (m.type === 'compaction') {
         const summary = m.summary || m.content || m.text || '';
         const summaryText = typeof summary === 'string' ? summary : (summary?.text || JSON.stringify(summary));
+        const modelStr = m.model
+          ? (m.model.providerID && m.model.id ? `${m.model.providerID}/${m.model.id}` : m.model.id)
+          : undefined;
         const info = {
           id: m.id || `compact_${Date.now()}`,
           role: 'compaction',
           time: m.time || {},
           isCompactSummary: true,
+          // Lifecycle facts from the persisted row: the host renders a failed
+          // compaction as a failure card, not as an empty summary.
+          status: m.status,
+          reason: m.reason || 'auto',
+          compactionStatus: m.status || 'completed',
+          compactionReason: m.reason || 'auto',
+          error: m.error,
+          tokens: m.tokens,
+          cost: m.cost,
+          model: modelStr,
+          providerID: m.model?.providerID,
+          modelID: m.model?.id,
           // The summary is the text part; `userContext` means a user-supplied
           // focus for /compact and must not be filled with the summary itself.
           compactMetadata: {
-            trigger: m.reason || 'manual',
+            trigger: m.reason || 'auto',
             ...(m.metadata && typeof m.metadata === 'object' ? m.metadata : {}),
           },
           sessionID: sessionId,
