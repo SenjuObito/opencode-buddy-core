@@ -105,9 +105,36 @@ const _activeTurns = new Map();
  * would keep a "compacting" card forever, so a stale entry is settled as a
  * failure once the session goes idle or the TTL expires.</p>
  *
- * @type {Map<string, { messageID: string, reason: string, startedAt: number, timer: NodeJS.Timeout | null }>}
+ * @type {Map<string, {
+ *   messageID: string,
+ *   outputMessageID: string,
+ *   reason: string,
+ *   startedAt: number,
+ *   summary: string,
+ *   tokens: object | null,
+ *   recent: unknown,
+ *   startedSent: boolean,
+ *   timer: NodeJS.Timeout | null
+ * }>}
  */
 const _activeCompactions = new Map();
+/**
+ * messageID → sessionID. v1 part/delta events normally carry a top-level
+ * `sessionID`, but older builds only put it inside `part`/`info`; this index
+ * lets an event that omits both still find its turn instead of being dropped.
+ * Bounded so a long-lived daemon cannot grow it without limit.
+ * @type {Map<string, string>}
+ */
+const _messageSessions = new Map();
+const MAX_TRACKED_MESSAGES = 4000;
+/**
+ * `${sessionID}:${compactionMessageID}` for compactions that already reached a
+ * terminal state. A late duplicate `message.updated` for the summary message
+ * must not re-arm the compaction and swallow the answer that follows.
+ * @type {Set<string>}
+ */
+const _completedCompactions = new Set();
+const MAX_COMPLETED_COMPACTIONS = 2000;
 /** A compaction that never reports a terminal event is failed after this long. */
 const COMPACTION_TTL_MS = 180_000;
 /** Grace after `session.idle` before a still-running compaction is failed. */
@@ -486,23 +513,53 @@ function _resolveSeq(evt, props) {
   return Number.isFinite(n) ? n : null;
 }
 
+function _rememberMessageSession(messageID, sessionID) {
+  if (typeof messageID !== 'string' || !messageID || !sessionID) return;
+  _messageSessions.set(messageID, sessionID);
+  if (_messageSessions.size > MAX_TRACKED_MESSAGES) {
+    const oldest = _messageSessions.keys().next().value;
+    if (oldest !== undefined) _messageSessions.delete(oldest);
+  }
+}
+
 function _handleEvent(evt) {
   const props = (evt && evt.properties && typeof evt.properties === 'object')
     ? evt.properties
     : ((evt && evt.data && typeof evt.data === 'object') ? evt.data : {});
   const type = typeof evt?.type === 'string' ? evt.type : '';
+  const sessionScoped = type.startsWith('session.');
+  const messageID = props?.info?.id
+    || props?.part?.messageID
+    || props?.messageID
+    || evt?.info?.id
+    || evt?.properties?.info?.id
+    || evt?.messageID;
+  // `props.info.id` is the *message* id on message events and the *session* id
+  // on session events. Only the latter may be used as a session identity;
+  // preferring it unconditionally used to make a v1 `message.updated` resolve
+  // to its own message id, so the compaction message missed its turn and the
+  // summary leaked into the transcript as ordinary text.
   const sessionID = props?.sessionID
     || props?.sessionId
     || props?.session_id
-    || props?.info?.id
     || props?.info?.sessionID
     || props?.info?.sessionId
+    || props?.part?.sessionID
+    || props?.part?.sessionId
+    || (sessionScoped ? (props?.info?.id || props?.id) : undefined)
     || evt?.sessionID
     || evt?.sessionId
-    || evt?.info?.id
     || evt?.properties?.sessionID
-    || evt?.properties?.info?.id
-    || evt?.data?.sessionID;
+    || evt?.data?.sessionID
+    || (sessionScoped ? (evt?.info?.id || evt?.properties?.info?.id) : undefined)
+    || (typeof messageID === 'string' ? _messageSessions.get(messageID) : undefined)
+    // Old v1 messages can omit `sessionID` entirely but still name the user
+    // message they answer. That parent was indexed when its part/update
+    // arrived, so it recovers the session without guessing.
+    || (typeof props?.info?.parentID === 'string' ? _messageSessions.get(props.info.parentID) : undefined);
+  if (sessionID && type.startsWith('message.') && typeof messageID === 'string' && messageID) {
+    _rememberMessageSession(messageID, sessionID);
+  }
   const seq = _resolveSeq(evt, props);
   const turn = sessionID ? _activeTurns.get(sessionID) : null;
   if (turn) {
@@ -1246,13 +1303,42 @@ function _revertStateForLifecycle(type, props) {
  * compaction (the engine runs one at a time), so the first start time wins and
  * a later id only fills in what was missing.</p>
  */
-function _beginActiveCompaction(sessionID, { messageID, reason } = {}) {
-  if (!sessionID) return;
+function _isPersistedMessageID(value) {
+  return typeof value === 'string' && value.startsWith('msg_');
+}
+
+function _rememberCompletedCompaction(sessionID, entry) {
+  if (!sessionID || !entry) return;
+  const id = entry.outputMessageID || entry.messageID;
+  if (!id) return;
+  const key = `${sessionID}:${id}`;
+  _completedCompactions.add(key);
+  if (_completedCompactions.size > MAX_COMPLETED_COMPACTIONS) {
+    const oldest = _completedCompactions.values().next().value;
+    if (oldest !== undefined) _completedCompactions.delete(oldest);
+  }
+}
+
+function _isCompletedCompaction(sessionID, messageID) {
+  return Boolean(sessionID && messageID && _completedCompactions.has(`${sessionID}:${messageID}`));
+}
+
+function _beginActiveCompaction(sessionID, { messageID, reason, startedAt } = {}) {
+  if (!sessionID) return null;
   const existing = _activeCompactions.get(sessionID);
+  const incomingID = _isPersistedMessageID(messageID) ? messageID : '';
   const entry = {
-    messageID: messageID || existing?.messageID || '',
+    messageID: existing?.messageID || incomingID,
+    // The summary message's persisted id is the only identity that survives a
+    // history reload. `inputID` / `evt_...` must never take its place.
+    outputMessageID: existing?.outputMessageID || '',
     reason: reason || existing?.reason || 'auto',
-    startedAt: existing?.startedAt ?? Date.now(),
+    startedAt: existing?.startedAt
+      ?? (typeof startedAt === 'number' && startedAt > 0 ? startedAt : Date.now()),
+    summary: existing?.summary || '',
+    tokens: existing?.tokens ?? null,
+    recent: existing?.recent ?? null,
+    startedSent: existing?.startedSent === true,
     timer: existing?.timer ?? null,
   };
   if (entry.timer) clearTimeout(entry.timer);
@@ -1262,6 +1348,52 @@ function _beginActiveCompaction(sessionID, { messageID, reason } = {}) {
   );
   entry.timer.unref?.();
   _activeCompactions.set(sessionID, entry);
+  return entry;
+}
+
+/**
+ * Start (or enrich) a compaction and emit `[COMPACTION_STARTED]` at most once.
+ *
+ * <p>v1 reports the same compaction through a `part.type=compaction` marker, a
+ * `message.updated` and (for a user-issued `/compact`) an explicit `started`.
+ * The host must see one STARTED per compaction, not one per signal.</p>
+ */
+function _emitCompactionStarted(sessionID, { messageID, reason, startedAt } = {}, turn = null) {
+  const entry = _beginActiveCompaction(sessionID, { messageID, reason, startedAt });
+  if (!entry) return null;
+  if (turn) {
+    turn.isCompaction = true;
+    // A new compaction in the same turn re-arms the terminal guard.
+    turn.compactionTerminated = false;
+  }
+  if (!entry.startedSent) {
+    entry.startedSent = true;
+    emitJsonStringMarker('[COMPACTION_STARTED]', {
+      sessionID,
+      messageID: entry.outputMessageID || entry.messageID || '',
+      reason: entry.reason,
+      startedAt: entry.startedAt,
+    });
+  }
+  return entry;
+}
+
+/**
+ * Clear the turn-level compaction routing flag.
+ *
+ * <p>`turn.isCompaction` is only a routing convenience. Leaving it set after
+ * one compaction used to swallow the answer that follows: the engine continues
+ * the same turn after `session.compacted`, so every subsequent delta stayed in
+ * the compaction channel.</p>
+ */
+function _resetTurnCompaction(turn) {
+  if (!turn) return;
+  turn.isCompaction = false;
+  turn.compactionTerminated = true;
+  turn.compactionSummary = '';
+  turn.compactionMessageID = '';
+  turn.compactionStartedAt = undefined;
+  turn.compactionReason = undefined;
 }
 
 /** Forget the running compaction and cancel its TTL timer. */
@@ -1276,19 +1408,39 @@ function _endActiveCompaction(sessionID) {
 function _failStaleCompaction(sessionID, message) {
   const entry = _activeCompactions.get(sessionID);
   if (!entry) return;
+  _rememberCompletedCompaction(sessionID, entry);
   _endActiveCompaction(sessionID);
+  _resetTurnCompaction(_activeTurns.get(sessionID));
+  clearManualCompaction(sessionID);
   logWarn('[compaction] terminal missing:', sessionID, message);
   emitJsonStringMarker('[COMPACTION_ENDED]', {
     sessionID,
-    messageID: entry.messageID,
+    messageID: entry.outputMessageID || entry.messageID,
     reason: entry.reason,
-    summary: '',
+    summary: entry.summary || '',
     failed: true,
     error: message,
     startedAt: entry.startedAt,
   });
   // Resolve after the marker so the host closes the optimistic record first.
   resolvePendingCompaction(sessionID, false, message);
+}
+
+/**
+ * v1 marks an automatic compaction by writing a `compaction` part onto the
+ * user message that triggered it. It arrives before the summary starts, so it
+ * is the earliest and most version-stable signal; `message.updated` alone is
+ * not enough on builds whose streaming info omits `mode`.
+ */
+function _maybeHandleCompactionPart(props, sessionID, turn) {
+  const part = props?.part;
+  if (!part || part.type !== 'compaction') return;
+  const sid = sessionID || part.sessionID;
+  if (!sid) return;
+  const reason = compactionReasonFor(sid, part.auto === false ? 'manual' : 'auto');
+  const startedAt = typeof part.time?.created === 'number' ? part.time.created : undefined;
+  logDebug('[compaction] part detected:', sid, 'auto:', part.auto, 'overflow:', part.overflow);
+  _emitCompactionStarted(sid, { reason, startedAt }, turn);
 }
 
 /**
@@ -1366,14 +1518,17 @@ function _dispatchInnerEvent(type, props, sessionID, turn, evt) {
       // Background children end outside the parent turn, so the engine's
       // synthetic notice has to be inspected before the turn gate.
       _maybeHandleSubagentNotice(props, sessionID);
+      // The compaction marker is authoritative on its own; do not hide it
+      // behind `turn` (manual compaction may run without an active turn).
+      _maybeHandleCompactionPart(props, sessionID, turn);
       if (turn) _handlePartUpdated(props, turn);
       break;
     case 'message.part.delta':
-      if (turn) _handlePartDelta(props, turn);
+      if (turn) _handlePartDelta(props, turn, sessionID);
       break;
     case 'message.updated': {
       // Track assistant message info (id/role/tokens/cost) for MESSAGE_END and turn usage aggregation.
-      if (turn && props?.info && typeof props.info === 'object') {
+      if (props?.info && typeof props.info === 'object') {
         const info = props.info;
         const isCompaction = info.role === 'compaction'
           || info.type === 'compaction'
@@ -1381,27 +1536,28 @@ function _dispatchInnerEvent(type, props, sessionID, turn, evt) {
           || info.agent === 'compaction'
           || info.isCompactSummary === true
           || info.summary === true;
-        if (isCompaction && !turn.isCompaction) {
-          turn.isCompaction = true;
-          turn.compactionSummary = '';
-          turn.compactionMessageID = info.id || '';
-          turn.compactionStartedAt = Date.now();
-          // The engine's own `reason` cannot tell a user `/compact` from its
-          // context-window compaction; the manual mark can.
-          turn.compactionReason = compactionReasonFor(sessionID || turn.sessionId, info.reason);
-          _beginActiveCompaction(sessionID || turn.sessionId, {
-            messageID: turn.compactionMessageID,
-            reason: turn.compactionReason,
-          });
-          emitJsonStringMarker('[COMPACTION_STARTED]', {
-            sessionID: sessionID || turn.sessionId,
-            messageID: info.id || '',
-            reason: turn.compactionReason,
-            startedAt: turn.compactionStartedAt,
-          });
+        const compactSessionID = sessionID || info.sessionID || turn?.sessionId;
+        if (isCompaction && compactSessionID) {
+          // A late duplicate update for a compaction that already ended must
+          // not create a second record and swallow the post-compaction answer.
+          const alreadyEnded = !_activeCompactions.has(compactSessionID)
+            && _isCompletedCompaction(compactSessionID, info.id);
+          if (!alreadyEnded) {
+            const entry = _emitCompactionStarted(compactSessionID, {
+              messageID: info.id,
+              // The engine's own `reason` cannot tell a user `/compact` from
+              // its context-window compaction; the manual mark can.
+              reason: compactionReasonFor(compactSessionID, info.reason),
+              startedAt: typeof info.time?.created === 'number' ? info.time.created : undefined,
+            }, turn);
+            if (entry) {
+              if (_isPersistedMessageID(info.id)) entry.outputMessageID = info.id;
+              if (info.tokens && typeof info.tokens === 'object') entry.tokens = info.tokens;
+            }
+          }
         }
         const isAssistant = info.role === 'assistant' || info.type === 'assistant';
-        if (isAssistant && !isCompaction) {
+        if (turn && isAssistant && !isCompaction) {
           turn.lastInfo = info;
           if (info.id) {
             turn.assistantMessagesMap.set(info.id, info);
@@ -1433,15 +1589,29 @@ function _dispatchInnerEvent(type, props, sessionID, turn, evt) {
       break;
     case 'session.reasoning.delta':
       if (turn && typeof props?.delta === 'string' && props.delta) {
+        const sid = sessionID || turn.sessionId;
+        // Reasoning produced while the summary is being written is part of the
+        // compaction, not of the answer. Forwarding it used to leave an extra
+        // thinking bubble behind the card.
+        if (sid && _activeCompactions.has(sid)) break;
         emitJsonStringMarker('[THINKING_DELTA]', props.delta);
       }
       break;
     case 'session.text.delta':
       if (turn && typeof props?.delta === 'string' && props.delta) {
-        if (turn.isCompaction) {
+        const sid = sessionID || turn.sessionId;
+        const active = sid ? _activeCompactions.get(sid) : null;
+        if (active) {
+          active.summary += props.delta;
+          emitJsonStringMarker('[COMPACTION_DELTA]', {
+            sessionID: sid,
+            text: props.delta,
+          });
+        } else if (turn.isCompaction) {
+          // Compatibility for a turn explicitly marked by older callers.
           turn.compactionSummary = (turn.compactionSummary || '') + props.delta;
           emitJsonStringMarker('[COMPACTION_DELTA]', {
-            sessionID: sessionID || turn.sessionId,
+            sessionID: sid,
             text: props.delta,
           });
         } else {
@@ -1687,29 +1857,56 @@ function _dispatchInnerEvent(type, props, sessionID, turn, evt) {
     case 'session.next.compaction.ended.1': {
       // 压缩完成信号。压缩不是 turn（无 active turn / done 信号可达 UI），
       // 必须经 marker 越权上报，宿主才能把结果送到对话列表。
-      const compactSessionID = sessionID || props?.info?.id || props?.data?.sessionID || props?.sessionID || '';
-      const summary = props?.text || props?.summary || props?.data?.text || props?.data?.summary || '';
-      const reason = compactionReasonFor(compactSessionID, props?.reason || props?.data?.reason);
+      const compactSessionID = sessionID
+        || props?.info?.sessionID
+        || props?.data?.sessionID
+        || props?.sessionID
+        || props?.info?.id
+        || '';
+      const active = compactSessionID ? _activeCompactions.get(compactSessionID) : null;
+      // v1 `session.compacted` carries only `{sessionID}`. The summary is the
+      // one accumulated from `message.part.delta`; both hosts deliberately
+      // ignore streaming deltas and read the terminal payload.
+      const eventSummary = props?.text || props?.summary || props?.data?.text || props?.data?.summary || '';
+      const summary = eventSummary || active?.summary || '';
+      const eventMessageID = props?.messageID || props?.data?.messageID;
       // `ended` carries the persisted compaction message id. The host adopts it
       // so a live card and the history row are one identity instead of two.
-      const messageID = props?.messageID || props?.data?.messageID || evt?.id || '';
-      const startedAt = _activeCompactions.get(compactSessionID)?.startedAt;
+      const messageID = _isPersistedMessageID(eventMessageID)
+        ? eventMessageID
+        : (active?.outputMessageID || active?.messageID || '');
+      const reason = compactionReasonFor(
+        compactSessionID,
+        props?.reason || props?.data?.reason || active?.reason,
+      );
+      const startedAt = active?.startedAt;
+      const tokens = props?.tokens || props?.data?.tokens || active?.tokens;
+      const recent = props?.recent || props?.data?.recent || active?.recent;
       logDebug('session.compacted / compaction.ended:', compactSessionID, 'summaryLength:', summary.length);
-      _endActiveCompaction(compactSessionID);
+
+      // Without a tracked compaction there is no summary to show. Do not
+      // invent an empty "compacted" card for a terminal we never started.
+      if (active || summary) {
+        _rememberCompletedCompaction(compactSessionID, active);
+        _endActiveCompaction(compactSessionID);
+        emitJsonStringMarker('[COMPACTION_ENDED]', {
+          sessionID: compactSessionID,
+          messageID,
+          summary,
+          reason,
+          tokens,
+          recent,
+          startedAt,
+        });
+      }
       clearManualCompaction(compactSessionID);
-      emitJsonStringMarker('[COMPACTION_ENDED]', {
-        sessionID: compactSessionID,
-        messageID,
-        summary,
-        reason,
-        tokens: props?.tokens || props?.data?.tokens,
-        recent: props?.recent || props?.data?.recent,
-        startedAt,
-      });
       emitJsonStringMarker('[SESSION_COMPACT_RESULT]', JSON.stringify({
         sessionID: compactSessionID,
         success: true,
       }));
+      // The engine continues the same turn after `session.compacted`; reset the
+      // routing flag here so the post-compaction answer goes to CONTENT_DELTA.
+      _resetTurnCompaction(_activeTurns.get(compactSessionID));
       // Resolve after the markers: the summarize RPC result must never reach the
       // host before the authoritative terminal record update.
       resolvePendingCompaction(compactSessionID, true);
@@ -1727,17 +1924,10 @@ function _dispatchInnerEvent(type, props, sessionID, turn, evt) {
       // Read the manual mark but do not clear it: the compaction is still
       // running and its ended/failed event needs the same answer.
       const reason = compactionReasonFor(compactSessionID, props?.reason || props?.data?.reason);
-      _beginActiveCompaction(compactSessionID, { messageID, reason });
-      // A repeated start belongs to the same compaction: report the original
-      // start time so the card's elapsed clock does not restart.
-      const startedAt = _activeCompactions.get(compactSessionID)?.startedAt ?? Date.now();
-      logDebug(`${type}:`, compactSessionID, reason);
-      emitJsonStringMarker('[COMPACTION_STARTED]', {
-        sessionID: compactSessionID,
-        messageID,
-        reason,
-        startedAt,
-      });
+      // A repeated start belongs to the same compaction: the helper keeps the
+      // original start time and emits STARTED only once.
+      const entry = _emitCompactionStarted(compactSessionID, { messageID, reason }, turn);
+      logDebug(`${type}:`, compactSessionID, reason, 'startedAt:', entry?.startedAt);
       break;
     }
     case 'session.compaction.delta':
@@ -1746,6 +1936,8 @@ function _dispatchInnerEvent(type, props, sessionID, turn, evt) {
       const text = typeof props?.text === 'string' ? props.text : (typeof props?.delta === 'string' ? props.delta : '');
       logDebug(`${type}:`, compactSessionID, 'deltaLength:', text.length);
       if (text) {
+        const entry = compactSessionID ? _activeCompactions.get(compactSessionID) : null;
+        if (entry) entry.summary += text;
         emitJsonStringMarker('[COMPACTION_DELTA]', {
           sessionID: compactSessionID,
           text,
@@ -1767,23 +1959,36 @@ function _dispatchInnerEvent(type, props, sessionID, turn, evt) {
       // 同样走 marker，宿主按 sessionID + pending 状态过滤。有 active turn
       // 时错误属于当前对话 turn，不能误报为压缩失败。
       if (!turn || isCompactionFailed) {
-        const compactSessionID = sessionID || props?.info?.id || props?.data?.sessionID || props?.sessionID || '';
-        const compactionTracked = _activeCompactions.has(compactSessionID);
+        const compactSessionID = sessionID
+          || props?.info?.sessionID
+          || props?.data?.sessionID
+          || props?.sessionID
+          || props?.info?.id
+          || '';
+        const active = compactSessionID ? _activeCompactions.get(compactSessionID) : null;
         // A generic `session.error` with no turn is not proof that a compaction
         // failed. Only report one when the engine says so or when a compaction
         // is actually running for this session — otherwise the host would
         // create a phantom failure card.
-        if (!isCompactionFailed && !compactionTracked) {
+        if (!isCompactionFailed && !active) {
           break;
         }
         logDebug(`${type} (compaction / no turn):`, compactSessionID, JSON.stringify(err).substring(0, 200));
         const failureMessage = err?.message || String(err);
-        const reason = compactionReasonFor(compactSessionID, props?.reason || props?.data?.reason);
-        const messageID = props?.inputID || props?.data?.inputID
-          || props?.messageID || props?.data?.messageID || evt?.id || '';
-        const startedAt = _activeCompactions.get(compactSessionID)?.startedAt;
+        const reason = compactionReasonFor(
+          compactSessionID,
+          props?.reason || props?.data?.reason || active?.reason,
+        );
+        const eventMessageID = props?.inputID || props?.data?.inputID
+          || props?.messageID || props?.data?.messageID;
+        const messageID = _isPersistedMessageID(eventMessageID)
+          ? eventMessageID
+          : (active?.outputMessageID || active?.messageID || '');
+        const startedAt = active?.startedAt;
+        _rememberCompletedCompaction(compactSessionID, active);
         _endActiveCompaction(compactSessionID);
         clearManualCompaction(compactSessionID);
+        _resetTurnCompaction(_activeTurns.get(compactSessionID));
         emitJsonStringMarker('[COMPACTION_FAILED]', {
           sessionID: compactSessionID,
           messageID,
@@ -1897,19 +2102,34 @@ function _handlePartUpdated(props, turn) {
  * Emit content/reasoning deltas. The part type comes from the tracked part
  * (delta events only carry `field` + `delta`).
  */
-function _handlePartDelta(props, turn) {
+function _handlePartDelta(props, turn, sessionID = null) {
   const partID = props?.partID;
   const delta = props?.delta;
   if (typeof delta !== 'string' || !delta) return;
   const part = partID ? turn.parts.get(partID) : null;
   const ptype = part?.type;
+  const sid = sessionID || turn.sessionId;
+  const active = sid ? _activeCompactions.get(sid) : null;
+  const messageID = typeof props?.messageID === 'string' ? props.messageID : '';
+  // Delimit the compaction window by the summary message id when it is known.
+  // Before `message.updated` names it, every delta belongs to the compaction.
+  const isCompactionOutput = Boolean(active)
+    && (!active.outputMessageID || !messageID || active.outputMessageID === messageID);
   if (ptype === 'reasoning') {
+    if (active) return;
     emitJsonStringMarker('[THINKING_DELTA]', delta);
   } else if (ptype === 'text' || !ptype) {
-    if (turn?.isCompaction) {
+    if (isCompactionOutput) {
+      active.summary += delta;
+      emitJsonStringMarker('[COMPACTION_DELTA]', {
+        sessionID: sid || turn.sessionId,
+        text: delta,
+      });
+    } else if (!active && turn?.isCompaction) {
+      // Compatibility for a turn explicitly marked by older callers.
       turn.compactionSummary = (turn.compactionSummary || '') + delta;
       emitJsonStringMarker('[COMPACTION_DELTA]', {
-        sessionID: turn.sessionId,
+        sessionID: sid || turn.sessionId,
         text: delta,
       });
     } else {
@@ -2023,17 +2243,21 @@ function _settleTurn(turn, { success, error, reason } = {}) {
   if (turn.settled) return;
   turn.settled = true;
   turn.settleReason = reason || (success ? 'idle' : 'error');
-  if (turn.isCompaction) {
-    const messageID = turn.compactionMessageID || '';
-    const startedAt = turn.compactionStartedAt;
-    const reason = turn.compactionReason || compactionReasonFor(turn.sessionId);
+  if (turn.isCompaction && !turn.compactionTerminated) {
+    const active = _activeCompactions.get(turn.sessionId);
+    const messageID = active?.outputMessageID || active?.messageID || turn.compactionMessageID || '';
+    const startedAt = turn.compactionStartedAt ?? active?.startedAt;
+    const reason = turn.compactionReason || active?.reason || compactionReasonFor(turn.sessionId);
+    const summary = turn.compactionSummary || active?.summary || '';
+    _rememberCompletedCompaction(turn.sessionId, active);
     _endActiveCompaction(turn.sessionId);
     if (success) {
       emitJsonStringMarker('[COMPACTION_ENDED]', {
         sessionID: turn.sessionId,
         messageID,
-        summary: turn.compactionSummary || '',
+        summary,
         reason,
+        tokens: active?.tokens,
         startedAt,
       });
     } else {
@@ -2053,7 +2277,10 @@ function _settleTurn(turn, { success, error, reason } = {}) {
       Boolean(success),
       error?.message || String(error || 'compaction failed'),
     );
-    turn.isCompaction = false;
+    _resetTurnCompaction(turn);
+    // The turn is finished; a later turn gets a fresh flag from
+    // `_emitCompactionStarted`, so keeping this set is the safe default.
+    turn.compactionTerminated = true;
   }
   // Tool-part reconciliation can emit `[MESSAGE]` blocks, including on the
   // watchdog path where there is no ambient identity — so give it one.
@@ -2855,6 +3082,8 @@ export async function shutdownPersistentRuntimes() {
     if (entry.timer) clearTimeout(entry.timer);
   }
   _activeCompactions.clear();
+  _messageSessions.clear();
+  _completedCompactions.clear();
 
   // Close every per-directory SSE subscription.
   for (const sub of _sseSubs.values()) {

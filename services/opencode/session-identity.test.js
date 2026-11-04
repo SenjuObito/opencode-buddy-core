@@ -807,4 +807,381 @@ test('v1 turn compaction resolves pending after [COMPACTION_ENDED]', async () =>
   }
 });
 
+// ── v1 automatic compaction (part-driven) ──────────────────────────────────
+// v1 emits no `session.compaction.started/ended` for an automatic compaction:
+// it writes a `compaction` part on the triggering user message, streams the
+// summary as ordinary part deltas, and closes with `session.compacted`
+// ({sessionID} only). These tests pin the contract that both hosts rely on.
+
+function readMarkers(emitted, prefix) {
+  return emitted
+    .filter((e) => e.line.startsWith(prefix))
+    .map((e) => JSON.parse(e.line.substring(prefix.length).trim()));
+}
+
+function installCompactionTurn(sessionId, requestId = 'req_compact') {
+  const turn = _createTurn(requestId, sessionId);
+  // `_createTurn` leaves the promise hooks null; the live send path installs
+  // them. Settling in a test only needs a no-op terminal.
+  turn.resolve = () => {};
+  turn.reject = () => {};
+  _activeTurns.set(sessionId, turn);
+  return turn;
+}
+
+test('v1 auto compaction: part starts the card, summary is isolated, answer returns to CONTENT_DELTA', () => {
+  const sessionId = 'ses_v1_auto_part';
+  const turn = installCompactionTurn(sessionId);
+
+  try {
+    const emitted = captureEmits(() => {
+      // Old v1 shape: the part owns the session identity; properties does not.
+      _handleEvent({
+        type: 'message.part.updated',
+        properties: {
+          part: {
+            id: 'prt_cmp_1',
+            messageID: 'msg_user_1',
+            sessionID: sessionId,
+            type: 'compaction',
+            auto: true,
+          },
+        },
+      });
+      // Streaming info has neither `mode` nor a top-level sessionID.
+      _handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'msg_cmp_1',
+            sessionID: sessionId,
+            role: 'assistant',
+            summary: true,
+            tokens: { input: 1200, output: 80 },
+          },
+        },
+      });
+      _handleEvent({
+        type: 'message.part.updated',
+        properties: {
+          part: { id: 'prt_sum_1', messageID: 'msg_cmp_1', sessionID: sessionId, type: 'text' },
+        },
+      });
+      _handleEvent({
+        type: 'message.part.delta',
+        properties: {
+          sessionID: sessionId,
+          messageID: 'msg_cmp_1',
+          partID: 'prt_sum_1',
+          field: 'text',
+          delta: 'first summary',
+        },
+      });
+      // Reasoning produced while the summary is written must not leak.
+      _handleEvent({
+        type: 'message.part.updated',
+        properties: {
+          part: { id: 'prt_reason_1', messageID: 'msg_cmp_1', sessionID: sessionId, type: 'reasoning' },
+        },
+      });
+      _handleEvent({
+        type: 'message.part.delta',
+        properties: {
+          sessionID: sessionId,
+          messageID: 'msg_cmp_1',
+          partID: 'prt_reason_1',
+          field: 'reasoning',
+          delta: 'private reasoning',
+        },
+      });
+      _handleEvent({
+        type: 'session.compacted',
+        properties: { sessionID: sessionId },
+      });
+
+      // The engine continues the same turn: this is the real answer.
+      _handleEvent({
+        type: 'message.part.updated',
+        properties: {
+          part: { id: 'prt_answer_1', messageID: 'msg_answer_1', sessionID: sessionId, type: 'text' },
+        },
+      });
+      _handleEvent({
+        type: 'message.part.delta',
+        properties: {
+          sessionID: sessionId,
+          messageID: 'msg_answer_1',
+          partID: 'prt_answer_1',
+          field: 'text',
+          delta: 'the real answer',
+        },
+      });
+
+      // A second automatic compaction in the same turn gets its own lifecycle.
+      _handleEvent({
+        type: 'message.part.updated',
+        properties: {
+          part: {
+            id: 'prt_cmp_2',
+            messageID: 'msg_user_2',
+            sessionID: sessionId,
+            type: 'compaction',
+            auto: true,
+          },
+        },
+      });
+      _handleEvent({
+        type: 'message.part.updated',
+        properties: {
+          part: { id: 'prt_sum_2', messageID: 'msg_cmp_2', sessionID: sessionId, type: 'text' },
+        },
+      });
+      _handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: { id: 'msg_cmp_2', sessionID: sessionId, role: 'assistant', mode: 'compaction' },
+        },
+      });
+      _handleEvent({
+        type: 'message.part.delta',
+        properties: {
+          sessionID: sessionId,
+          messageID: 'msg_cmp_2',
+          partID: 'prt_sum_2',
+          field: 'text',
+          delta: 'second summary',
+        },
+      });
+      _handleEvent({
+        type: 'session.compacted',
+        properties: { sessionID: sessionId },
+      });
+
+      // The fallback terminal must not emit a third card.
+      _settleTurn(turn, { success: true });
+    });
+
+    const started = readMarkers(emitted, '[COMPACTION_STARTED]');
+    assert.equal(started.length, 2, 'one STARTED per compaction, not per signal');
+    assert.deepEqual(started.map((p) => p.reason), ['auto', 'auto']);
+
+    const compactionDeltas = readMarkers(emitted, '[COMPACTION_DELTA]');
+    assert.deepEqual(
+      compactionDeltas.map((p) => p.text),
+      ['first summary', 'second summary'],
+      'only the two summaries may use the compaction channel',
+    );
+
+    const content = emitted
+      .filter((e) => e.line.startsWith('[CONTENT_DELTA]'))
+      .map((e) => JSON.parse(e.line.substring('[CONTENT_DELTA]'.length).trim()));
+    assert.deepEqual(content, ['the real answer'], 'the answer must leave the compaction channel');
+    assert.equal(
+      emitted.find((e) => e.line.startsWith('[THINKING_DELTA]')),
+      undefined,
+      'reasoning during compaction must not reach the host',
+    );
+
+    const ended = readMarkers(emitted, '[COMPACTION_ENDED]');
+    assert.equal(ended.length, 2, 'turn settle must not duplicate the terminal');
+    assert.equal(ended[0].summary, 'first summary');
+    assert.equal(ended[0].messageID, 'msg_cmp_1');
+    assert.deepEqual(ended[0].tokens, { input: 1200, output: 80 });
+    assert.equal(ended[1].summary, 'second summary');
+    assert.equal(ended[1].messageID, 'msg_cmp_2');
+  } finally {
+    _activeTurns.delete(sessionId);
+  }
+});
+
+test('v1 message.updated resolves the turn from info.sessionID, never from info.id', () => {
+  const sessionId = 'ses_v1_info_session';
+  const turn = installCompactionTurn(sessionId);
+  try {
+    const emitted = captureEmits(() => {
+      _handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: { id: 'msg_cmp_info', sessionID: sessionId, role: 'assistant', mode: 'compaction' },
+        },
+      });
+      _handleEvent({
+        type: 'session.compacted',
+        properties: { sessionID: sessionId },
+      });
+      _settleTurn(turn, { success: true });
+    });
+
+    const started = readMarkers(emitted, '[COMPACTION_STARTED]');
+    assert.equal(started.length, 1);
+    assert.equal(started[0].sessionID, sessionId, 'info.id is a message id and must not name the session');
+    assert.equal(started[0].messageID, 'msg_cmp_info');
+
+    const ended = readMarkers(emitted, '[COMPACTION_ENDED]');
+    assert.equal(ended.length, 1);
+    assert.equal(ended[0].messageID, 'msg_cmp_info');
+  } finally {
+    _activeTurns.delete(sessionId);
+  }
+});
+
+test('v1 message.updated falls back to parentID when it carries no sessionID', () => {
+  const sessionId = 'ses_v1_parent_index';
+  const turn = installCompactionTurn(sessionId);
+  try {
+    const emitted = captureEmits(() => {
+      // Index the triggering user message first (part events carry sessionID
+      // even on builds where message.updated does not).
+      _handleEvent({
+        type: 'message.part.updated',
+        properties: {
+          part: { id: 'prt_parent', messageID: 'msg_parent', sessionID: sessionId, type: 'text' },
+        },
+      });
+      _handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'msg_cmp_parent',
+            parentID: 'msg_parent',
+            role: 'assistant',
+            mode: 'compaction',
+          },
+        },
+      });
+      _handleEvent({
+        type: 'session.compacted',
+        properties: { sessionID: sessionId },
+      });
+      _settleTurn(turn, { success: true });
+    });
+
+    const started = readMarkers(emitted, '[COMPACTION_STARTED]');
+    assert.equal(started.length, 1);
+    assert.equal(started[0].sessionID, sessionId);
+    assert.equal(started[0].messageID, 'msg_cmp_parent');
+    assert.equal(readMarkers(emitted, '[COMPACTION_ENDED]').length, 1);
+  } finally {
+    _activeTurns.delete(sessionId);
+  }
+});
+
+test('v1 compaction: session.text.delta accumulates the summary and resets before the answer', () => {
+  const sessionId = 'ses_v1_text_delta';
+  const turn = installCompactionTurn(sessionId);
+  try {
+    const emitted = captureEmits(() => {
+      _handleEvent({
+        type: 'message.part.updated',
+        properties: {
+          part: {
+            id: 'prt_cmp_text',
+            messageID: 'msg_user_text',
+            sessionID: sessionId,
+            type: 'compaction',
+            auto: true,
+          },
+        },
+      });
+      _handleEvent({
+        type: 'session.text.delta',
+        properties: { sessionID: sessionId, delta: 'summary via text' },
+      });
+      _handleEvent({
+        type: 'session.text.delta',
+        properties: { sessionID: sessionId, delta: ' and more' },
+      });
+      _handleEvent({
+        type: 'session.compacted',
+        properties: { sessionID: sessionId },
+      });
+      _handleEvent({
+        type: 'session.text.delta',
+        properties: { sessionID: sessionId, delta: 'answer via text' },
+      });
+      _settleTurn(turn, { success: true });
+    });
+
+    assert.deepEqual(
+      readMarkers(emitted, '[COMPACTION_DELTA]').map((p) => p.text),
+      ['summary via text', ' and more'],
+    );
+    const ended = readMarkers(emitted, '[COMPACTION_ENDED]');
+    assert.equal(ended.length, 1);
+    assert.equal(ended[0].summary, 'summary via text and more');
+    assert.deepEqual(
+      emitted
+        .filter((e) => e.line.startsWith('[CONTENT_DELTA]'))
+        .map((e) => JSON.parse(e.line.substring('[CONTENT_DELTA]'.length).trim())),
+      ['answer via text'],
+    );
+  } finally {
+    _activeTurns.delete(sessionId);
+  }
+});
+
+test('v1 session.compacted with no tracked compaction and no summary does not invent an empty card', () => {
+  const sessionId = 'ses_v1_empty_compacted';
+  const emitted = captureEmits(() => {
+    _handleEvent({
+      type: 'session.compacted',
+      properties: { sessionID: sessionId },
+    });
+  });
+
+  assert.equal(readMarkers(emitted, '[COMPACTION_ENDED]').length, 0);
+  const result = emitted.find((e) => e.line.startsWith('[SESSION_COMPACT_RESULT]'));
+  assert.ok(result, 'the compatibility result marker still resolves the command plane');
+  const outer = JSON.parse(result.line.substring('[SESSION_COMPACT_RESULT]'.length).trim());
+  const payload = typeof outer === 'string' ? JSON.parse(outer) : outer;
+  assert.equal(payload.success, true);
+});
+
+test('a late message.updated for an already-failed compaction does not start it again', () => {
+  const sessionId = 'ses_v1_late_update';
+  const turn = installCompactionTurn(sessionId);
+  try {
+    const emitted = captureEmits(() => {
+      _handleEvent({
+        type: 'message.part.updated',
+        properties: {
+          part: {
+            id: 'prt_cmp_late',
+            messageID: 'msg_user_late',
+            sessionID: sessionId,
+            type: 'compaction',
+            auto: true,
+          },
+        },
+      });
+      _handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: { id: 'msg_cmp_late', sessionID: sessionId, role: 'assistant', mode: 'compaction' },
+        },
+      });
+      _handleEvent({
+        type: 'session.compaction.failed',
+        properties: {
+          sessionID: sessionId,
+          error: { message: 'engine aborted the compaction' },
+        },
+      });
+      // A duplicate terminal update arrives after the failure.
+      _handleEvent({
+        type: 'message.updated',
+        properties: {
+          info: { id: 'msg_cmp_late', sessionID: sessionId, role: 'assistant', mode: 'compaction' },
+        },
+      });
+      _settleTurn(turn, { success: true });
+    });
+
+    assert.equal(readMarkers(emitted, '[COMPACTION_STARTED]').length, 1);
+    assert.equal(readMarkers(emitted, '[COMPACTION_FAILED]').length, 1);
+    assert.equal(readMarkers(emitted, '[COMPACTION_ENDED]').length, 0);
+  } finally {
+    _activeTurns.delete(sessionId);
+  }
+});
 
